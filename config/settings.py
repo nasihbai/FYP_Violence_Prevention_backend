@@ -54,7 +54,7 @@ class ModelConfig:
     YOLO_PERSON_CLASS = 0  # COCO class ID for person
 
     # LSTM Configuration
-    LSTM_MODEL_PATH = MODELS_DIR / "violence_lstm_enhanced.h5"
+    LSTM_MODEL_PATH = BASE_DIR / "lstm-model.h5"
     LSTM_SEQUENCE_LENGTH = 20  # Number of frames for temporal analysis
     LSTM_UNITS = 64
     LSTM_DROPOUT = 0.3
@@ -167,6 +167,15 @@ class WebConfig:
     # Video streaming
     STREAM_QUALITY = 80  # JPEG quality (1-100)
     STREAM_FPS = 15
+
+# =============================================================================
+# DATABASE CONFIGURATION
+# =============================================================================
+class DatabaseConfig:
+    # SQLite by default (no setup required).
+    # Override with DATABASE_URL env var for PostgreSQL:
+    #   DATABASE_URL=postgresql://user:password@localhost/violence_db
+    URL = "sqlite:///violence_detection.db"
 
 # =============================================================================
 # LOGGING CONFIGURATION

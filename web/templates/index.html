@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Violence Detection System - Dashboard</title>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -269,6 +270,10 @@
             }
         }
 
+        .severity-high   { color: #ff4757; font-weight: 700; }
+        .severity-medium { color: #ffa502; font-weight: 700; }
+        .severity-low    { color: #2ed573; font-weight: 700; }
+
         /* Custom scrollbar */
         ::-webkit-scrollbar {
             width: 8px;
@@ -366,69 +371,92 @@
     </div>
 
     <script>
-        // Update stats every second
-        setInterval(updateStats, 1000);
-        setInterval(updateAlerts, 5000);
+        // ── Socket.IO real-time connection ─────────────────────────────────────
+        const socket = io();
 
-        // Load initial config
-        loadConfig();
+        socket.on('connect', () => console.log('Socket connected:', socket.id));
+        socket.on('disconnect', () => console.warn('Socket disconnected'));
 
-        async function updateStats() {
-            try {
-                const response = await fetch('/api/stats');
-                const data = await response.json();
+        // Server pushes stats every second
+        socket.on('stats_update', (data) => {
+            document.getElementById('total-frames').textContent = formatNumber(data.total_frames);
+            document.getElementById('current-fps').textContent = data.current_fps.toFixed(1);
+            document.getElementById('violence-count').textContent = formatNumber(data.violence_detections);
+            document.getElementById('uptime').textContent = data.uptime || '00:00:00';
+            document.getElementById('fps-display').textContent = `FPS: ${data.current_fps.toFixed(1)}`;
 
-                document.getElementById('total-frames').textContent = formatNumber(data.total_frames);
-                document.getElementById('current-fps').textContent = data.current_fps.toFixed(1);
-                document.getElementById('violence-count').textContent = formatNumber(data.violence_detections);
-                document.getElementById('uptime').textContent = data.uptime || '00:00:00';
-                document.getElementById('fps-display').textContent = `FPS: ${data.current_fps.toFixed(1)}`;
-
-                // Update status badge
-                const badge = document.getElementById('status-badge');
-                if (data.is_running) {
-                    badge.textContent = 'Running';
-                    badge.className = 'status-badge status-running';
-                } else {
-                    badge.textContent = 'Stopped';
-                    badge.className = 'status-badge status-stopped';
-                }
-            } catch (error) {
-                console.error('Failed to update stats:', error);
+            const badge = document.getElementById('status-badge');
+            if (data.is_running) {
+                badge.textContent = 'Running';
+                badge.className = 'status-badge status-running';
+            } else {
+                badge.textContent = 'Stopped';
+                badge.className = 'status-badge status-stopped';
             }
-        }
+        });
 
-        async function updateAlerts() {
+        // Server pushes a new alert the moment violence is detected
+        socket.on('violence_alert', (alert) => {
+            prependAlert(alert);
+        });
+
+        // ── Initial data load ───────────────────────────────────────────────────
+        loadConfig();
+        loadAlerts();
+
+        async function loadAlerts() {
             try {
                 const response = await fetch('/api/alerts?limit=10');
                 const alerts = await response.json();
-
                 const alertList = document.getElementById('alert-list');
-
                 if (alerts.length === 0) {
                     alertList.innerHTML = '<div class="no-alerts">No alerts yet</div>';
                     return;
                 }
+                alertList.innerHTML = alerts.map(alertHTML).join('');
+            } catch (error) {
+                console.error('Failed to load alerts:', error);
+            }
+        }
 
-                alertList.innerHTML = alerts.reverse().map(alert => `
-                    <div class="alert-item">
-                        <div class="alert-icon">⚠️</div>
-                        <div class="alert-info">
-                            <div class="alert-time">${new Date(alert.timestamp).toLocaleTimeString()}</div>
-                            <div class="alert-detail">Person ${alert.person_id} - ${(alert.confidence * 100).toFixed(1)}% confidence</div>
+        function prependAlert(alert) {
+            const alertList = document.getElementById('alert-list');
+            // Remove placeholder if present
+            const placeholder = alertList.querySelector('.no-alerts');
+            if (placeholder) placeholder.remove();
+
+            const div = document.createElement('div');
+            div.innerHTML = alertHTML(alert);
+            alertList.insertBefore(div.firstChild, alertList.firstChild);
+
+            // Cap displayed list at 20 items
+            while (alertList.children.length > 20) {
+                alertList.removeChild(alertList.lastChild);
+            }
+        }
+
+        function alertHTML(alert) {
+            const severityClass = `severity-${alert.severity || 'medium'}`;
+            const time = new Date(alert.timestamp).toLocaleTimeString();
+            const conf = (alert.confidence * 100).toFixed(1);
+            const pid  = alert.person_id !== null ? `Person ${alert.person_id}` : 'Unknown';
+            return `
+                <div class="alert-item">
+                    <div class="alert-icon">⚠️</div>
+                    <div class="alert-info">
+                        <div class="alert-time">${time}</div>
+                        <div class="alert-detail">
+                            ${pid} — ${conf}%
+                            <span class="${severityClass}">[${(alert.severity || 'medium').toUpperCase()}]</span>
                         </div>
                     </div>
-                `).join('');
-            } catch (error) {
-                console.error('Failed to update alerts:', error);
-            }
+                </div>`;
         }
 
         async function loadConfig() {
             try {
                 const response = await fetch('/api/config');
                 const config = await response.json();
-
                 document.getElementById('threshold-slider').value = config.violence_threshold;
                 document.getElementById('threshold-value').textContent = config.violence_threshold.toFixed(2);
                 document.getElementById('yolo-status').textContent = config.use_yolo ? 'Enabled' : 'Disabled';
@@ -440,6 +468,7 @@
             }
         }
 
+        // ── Controls ────────────────────────────────────────────────────────────
         async function startDetection() {
             try {
                 await fetch('/api/start', { method: 'POST' });
@@ -460,8 +489,7 @@
         async function resetStats() {
             try {
                 await fetch('/api/reset', { method: 'POST' });
-                updateStats();
-                updateAlerts();
+                loadAlerts();
             } catch (error) {
                 console.error('Failed to reset stats:', error);
             }

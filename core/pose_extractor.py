@@ -108,6 +108,8 @@ class PoseExtractor:
     ) -> Optional[PoseLandmarks]:
         """
         Extract pose from a cropped region.
+        Landmarks are kept in crop-relative coordinates to match the
+        feature engineering pipeline used during training.
 
         Args:
             frame: Full frame
@@ -119,7 +121,7 @@ class PoseExtractor:
         """
         x1, y1, x2, y2 = bbox
 
-        # Add padding
+        # Add padding — matches detect_violence.py PAD=20
         h, w = frame.shape[:2]
         pad = 20
         x1 = max(0, x1 - pad)
@@ -127,30 +129,14 @@ class PoseExtractor:
         x2 = min(w, x2 + pad)
         y2 = min(h, y2 + pad)
 
-        # Crop
         crop = frame[y1:y2, x1:x2]
 
-        if crop.size == 0:
+        if crop.size == 0 or crop.shape[0] < 32 or crop.shape[1] < 32:
             return None
 
-        # Extract pose from crop
-        result = self.extract(crop, person_id)
-
-        if result is None:
-            return None
-
-        # Adjust coordinates to full frame
-        crop_h, crop_w = crop.shape[:2]
-        adjusted_landmarks = result.landmarks.copy()
-
-        for i in range(0, len(adjusted_landmarks), 4):
-            # Scale x coordinate
-            adjusted_landmarks[i] = (adjusted_landmarks[i] * crop_w + x1) / w
-            # Scale y coordinate
-            adjusted_landmarks[i + 1] = (adjusted_landmarks[i + 1] * crop_h + y1) / h
-
-        result.landmarks = adjusted_landmarks
-        return result
+        # Extract pose — landmarks stay in crop-relative coordinates
+        # (same as detect_violence.py, which the model was trained on)
+        return self.extract(crop, person_id)
 
     def draw_landmarks(
         self,
@@ -236,34 +222,33 @@ class LandmarkBuffer:
 
     def add(self, landmarks: PoseLandmarks) -> Optional[np.ndarray]:
         """
-        Add landmarks to buffer and return sequence if ready.
+        Add landmarks to buffer and return the current sequence if ready.
+
+        Uses a rolling deque — the buffer is NEVER cleared after a prediction.
+        Every new frame shifts the window by one, so predictions happen on
+        every frame once the buffer is full (matches detect_violence.py behaviour).
 
         Args:
             landmarks: Pose landmarks to add
 
         Returns:
-            Sequence array if buffer is full, None otherwise
+            Sequence array (shape: sequence_length × 132) once buffer is full,
+            None while still warming up.
         """
         with self._lock:
             person_id = landmarks.person_id
 
-            # Create buffer for new person
             if person_id not in self._buffers:
                 if len(self._buffers) >= self.max_persons:
-                    # Remove oldest person
                     oldest = min(self._buffers.keys())
                     del self._buffers[oldest]
-
                 self._buffers[person_id] = deque(maxlen=self.sequence_length)
 
-            # Add landmarks
             self._buffers[person_id].append(landmarks.landmarks)
 
-            # Return sequence if buffer is full
+            # Return rolling window once the buffer is full
             if len(self._buffers[person_id]) == self.sequence_length:
-                sequence = np.array(list(self._buffers[person_id]))
-                self._buffers[person_id].clear()
-                return sequence
+                return np.array(list(self._buffers[person_id]))
 
             return None
 

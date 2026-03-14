@@ -302,7 +302,8 @@ class ViolenceClassifier:
             custom_objects = {
                 'Orthogonal': tf.keras.initializers.Orthogonal,
                 'AttentionLayer': AttentionLayer,
-                'TemporalBlock': TemporalBlock
+                'TemporalBlock': TemporalBlock,
+                'keras': tf.keras,   # needed for models with Lambda layers
             }
 
             model_path = Path(model_path)
@@ -323,39 +324,83 @@ class ViolenceClassifier:
     def _load_h5_model(self, model_path: str, custom_objects: dict) -> Model:
         """
         Load H5 model with compatibility handling for older models.
+        Strategy:
+          1. Try direct keras load (works for enhanced model saved in Keras 2 format)
+          2. Rebuild architecture from weight shapes + load weights by name
+             (handles models saved with DTypePolicy / batch_shape Keras 3 issues)
         """
+        # Strategy 1: direct load
         try:
-            # Try direct loading first
             return keras.models.load_model(model_path, custom_objects=custom_objects)
         except Exception:
-            # Fall back to manual loading for compatibility
-            with h5py.File(model_path, 'r') as f:
-                model_config = f.attrs.get('model_config')
-                if isinstance(model_config, bytes):
-                    model_config = model_config.decode('utf-8')
-                model_config = json.loads(model_config)
+            pass
 
-                # Remove incompatible attributes
-                for layer in model_config['config']['layers']:
-                    if 'time_major' in layer.get('config', {}):
-                        del layer['config']['time_major']
+        # Strategy 2: infer architecture from weights, load weights by name
+        return self._rebuild_from_weights(model_path)
 
-                model_json = json.dumps(model_config)
-                model = keras.models.model_from_json(model_json, custom_objects=custom_objects)
+    def _rebuild_from_weights(self, model_path: str) -> Model:
+        """
+        Reconstruct the model by reading weight shapes from the H5 file,
+        building a matching Sequential architecture, and loading weights by name.
 
-                # Load weights
-                weights_group = f['model_weights']
-                for layer in model.layers:
-                    layer_name = layer.name
-                    if layer_name in weights_group:
-                        weight_names = weights_group[layer_name].attrs['weight_names']
-                        layer_weights = [
-                            np.array(weights_group[layer_name][wn])
-                            for wn in weight_names
-                        ]
-                        layer.set_weights(layer_weights)
+        This handles the case where the H5 was saved with a different Keras
+        version that uses DTypePolicy / batch_shape / batch_input_shape keys.
+        """
+        with h5py.File(model_path, 'r') as f:
+            wg = f['model_weights']
 
-                return model
+            # Collect (layer_name → weight_shapes) for named layers
+            layer_shapes: Dict[str, List[tuple]] = {}
+            for name in wg.keys():
+                g = wg[name]
+                if 'weight_names' in g.attrs:
+                    wnames = g.attrs['weight_names']
+                    layer_shapes[name] = [tuple(wg[name][wn].shape) for wn in wnames]
+
+        lstm_names   = sorted(k for k in layer_shapes if k.startswith('lstm'))
+        dense_names  = sorted(k for k in layer_shapes if k.startswith('dense'))
+        has_bn       = any(k.startswith('batch_normalization') for k in layer_shapes)
+        has_bidir    = any(k.startswith('bidirectional') for k in layer_shapes)
+
+        if not lstm_names or not dense_names:
+            raise ValueError("Cannot infer architecture: no lstm/dense layers found in weights")
+
+        # Infer input_dim and units from LSTM kernel shapes (kernel: [input_dim, 4*units])
+        def lstm_dims(name):
+            kernel_shape = layer_shapes[name][0]   # (input_dim, 4*units)
+            return kernel_shape[0], kernel_shape[1] // 4
+
+        input_dim, _ = lstm_dims(lstm_names[0])
+        num_outputs  = layer_shapes[dense_names[-1]][0][-1]
+        activation   = 'sigmoid' if num_outputs == 1 else 'softmax'
+
+        # Build architecture
+        inp = keras.Input(shape=(self.sequence_length, input_dim))
+        x = inp
+        for i, lname in enumerate(lstm_names):
+            _, units = lstm_dims(lname)
+            return_seq = i < len(lstm_names) - 1
+            lstm_layer = layers.LSTM(units, return_sequences=return_seq, name=lname)
+            if has_bidir:
+                x = layers.Bidirectional(lstm_layer, name=f'bidirectional_{i}')(x)
+            else:
+                x = lstm_layer(x)
+            if has_bn:
+                bn_name = 'batch_normalization' if i == 0 else f'batch_normalization_{i}'
+                x = layers.BatchNormalization(name=bn_name)(x)
+            x = layers.Dropout(0.3, name=f'dropout_{i}')(x)
+
+        for i, dname in enumerate(dense_names[:-1]):
+            units = layer_shapes[dname][0][-1]
+            x = layers.Dense(units, activation='relu', name=dname)(x)
+            x = layers.Dropout(0.3, name=f'dropout_d{i}')(x)
+
+        x = layers.Dense(num_outputs, activation=activation, name=dense_names[-1])(x)
+
+        model = keras.Model(inputs=inp, outputs=x)
+        model.load_weights(model_path, by_name=True, skip_mismatch=True)
+        logger.info(f"Rebuilt model from weights: input={input_dim} outputs={num_outputs}")
+        return model
 
     def predict(
         self,

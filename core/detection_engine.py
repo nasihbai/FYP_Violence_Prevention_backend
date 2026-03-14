@@ -88,6 +88,7 @@ class ThreadSafeDetector:
         self._frame_count = 0
         self._running = False
         self._workers: List[threading.Thread] = []
+        self._pose_cache: Dict[int, any] = {}   # person_id → last PoseLandmarks
 
         # Components
         self.pose_extractor = None
@@ -181,6 +182,13 @@ class ThreadSafeDetector:
                 person_id, sequence = item
 
                 if self.lstm_classifier is not None:
+                    # Apply feature engineering when the model expects more features
+                    # than the raw landmark count (132 → 309).
+                    model_features = self.lstm_classifier.model.input_shape[-1]
+                    if model_features != sequence.shape[-1]:
+                        from .feature_engineering import extract_features_from_sequence, DEFAULT_CONFIG
+                        sequence = extract_features_from_sequence(sequence, DEFAULT_CONFIG)
+
                     is_violent, confidence = self.lstm_classifier.is_violent(
                         sequence, person_id
                     )
@@ -250,6 +258,10 @@ class ThreadSafeDetector:
                 )
 
                 if pose is not None:
+                    # Cache latest pose for skeleton drawing
+                    with self._lock:
+                        self._pose_cache[det.id] = pose
+
                     # Add to buffer
                     sequence = self.landmark_buffer.add(pose)
 
@@ -288,6 +300,8 @@ class ThreadSafeDetector:
             pose = self.pose_extractor.extract(frame, person_id=0)
 
             if pose is not None:
+                with self._lock:
+                    self._pose_cache[0] = pose
                 sequence = self.landmark_buffer.add(pose)
 
                 if sequence is not None:
@@ -324,7 +338,7 @@ class ThreadSafeDetector:
         self,
         frame: np.ndarray,
         result: FrameResult,
-        show_skeleton: bool = True,
+        show_skeleton: bool = False,
         show_fps: bool = True
     ) -> np.ndarray:
         """
@@ -363,6 +377,17 @@ class ThreadSafeDetector:
             (200, 200, 200),
             1
         )
+
+        # Draw skeleton for each tracked person
+        if show_skeleton and self.pose_extractor is not None:
+            with self._lock:
+                pose_snapshot = dict(self._pose_cache)
+                result_snapshot = dict(self._result_cache)
+
+            for pid, pose_lm in pose_snapshot.items():
+                is_violent = result_snapshot.get(pid, DetectionResult(pid, (0,0,0,0), False, 0, 'neutral', 0)).is_violent
+                dot_color = (0, 0, 220) if is_violent else (0, 220, 0)
+                annotated = self.pose_extractor.draw_landmarks(annotated, pose_lm)
 
         # Draw detections
         for det in result.detections:
@@ -429,6 +454,7 @@ class ThreadSafeDetector:
             self._frame_count = 0
             self._result_cache.clear()
             self._prediction_history.clear()
+            self._pose_cache.clear()
             self.landmark_buffer.clear()
 
             if self.lstm_classifier:

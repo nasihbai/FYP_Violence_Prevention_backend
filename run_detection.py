@@ -50,14 +50,16 @@ def run_detection(args):
     # Determine model path
     model_path = args.model
     if model_path is None:
-        # Try enhanced model first, then original
-        enhanced_path = Path(__file__).parent / 'models' / 'violence_lstm_enhanced.h5'
-        original_path = Path(__file__).parent / 'lstm-model.h5'
-
-        if enhanced_path.exists():
-            model_path = str(enhanced_path)
-        elif original_path.exists():
-            model_path = str(original_path)
+        root = Path(__file__).parent
+        candidates = [
+            root / 'models' / 'violence_lstm_dataset.h5',   # 309-feature, proven pipeline
+            root / 'lstm-model.h5',
+            root / 'models' / 'violence_lstm_rwf2000.h5',
+            root / 'models' / 'violence_lstm_enhanced.h5',
+        ]
+        found = next((p for p in candidates if p.exists()), None)
+        if found:
+            model_path = str(found)
         else:
             logger.warning("No model found. Running without LSTM classification.")
             model_path = None
@@ -126,13 +128,14 @@ def run_web_dashboard(args):
     # Determine model path
     model_path = args.model
     if model_path is None:
-        enhanced_path = Path(__file__).parent / 'models' / 'violence_lstm_enhanced.h5'
-        original_path = Path(__file__).parent / 'lstm-model.h5'
-
-        if enhanced_path.exists():
-            model_path = str(enhanced_path)
-        elif original_path.exists():
-            model_path = str(original_path)
+        root = Path(__file__).parent
+        candidates = [
+            root / 'models' / 'violence_lstm_dataset.h5',   # 309-feature, proven pipeline
+            root / 'lstm-model.h5',
+            root / 'models' / 'violence_lstm_rwf2000.h5',
+            root / 'models' / 'violence_lstm_enhanced.h5',
+        ]
+        model_path = next((str(p) for p in candidates if p.exists()), None)
 
     logger.info(f"Starting web dashboard on http://{args.host}:{args.port}")
     logger.info(f"Model: {model_path}")
