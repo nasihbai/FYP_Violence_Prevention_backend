@@ -30,7 +30,8 @@ from config import WebConfig, VideoConfig, AlertConfig
 from core.detection_engine import ThreadSafeDetector, FrameResult
 from database import init_db, User, Stream, Incident, Alert, DetectionLog
 from database.db import get_session
-from auth import auth_bp, require_manage_role, seed_demo_users
+from .auth import auth_bp, require_manage_role, seed_demo_users
+from .api import api_bp
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ socketio = SocketIO(app, cors_allowed_origins=_cors_value, async_mode='threading
 jwt = JWTManager(app)
 
 app.register_blueprint(auth_bp)
+app.register_blueprint(api_bp)
 
 
 # ==================== ERROR HANDLERS ====================
@@ -350,29 +352,6 @@ def get_stats():
         'uptime': uptime,
         'is_running': is_running,
     })
-
-
-@app.route('/api/alerts')
-def get_alerts():
-    """Return incident history — requires valid JWT."""
-    from flask_jwt_extended import verify_jwt_in_request
-    try:
-        verify_jwt_in_request()
-    except Exception:
-        return jsonify({'message': 'Unauthorized'}), 401
-
-    limit = request.args.get('limit', 50, type=int)
-    session = get_session()
-    try:
-        alerts = (
-            session.query(Alert)
-            .order_by(Alert.timestamp.desc())
-            .limit(limit)
-            .all()
-        )
-        return jsonify([a.to_dict() for a in alerts])
-    finally:
-        session.close()
 
 
 @app.route('/api/config', methods=['GET', 'POST'])
