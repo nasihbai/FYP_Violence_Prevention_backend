@@ -32,9 +32,12 @@ import logging
 import importlib
 from pathlib import Path
 
+from datetime import datetime
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from flask_jwt_extended import JWTManager
+from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity
+from flask_socketio import SocketIO
 
 _REPO_ROOT = Path(__file__).parent
 sys.path.insert(0, str(_REPO_ROOT))
@@ -83,8 +86,83 @@ _cors_value = (
 CORS(app, resources={r"/*": {"origins": _cors_value}}, supports_credentials=True)
 
 jwt = JWTManager(app)
+socketio = SocketIO(app, cors_allowed_origins=_cors_value, async_mode="threading")
+
 app.register_blueprint(auth_bp)
 app.register_blueprint(api_bp)
+
+
+# ==================== TEST-FIRE ENDPOINT ====================
+# Manually emit a SocketIO 'violence_alert' so the FE can verify real-time
+# wiring without needing the detector pipeline. Only registered here in
+# the slim server — the full server gets real alerts from the detector.
+
+from database import Stream, Incident, Alert
+from database.db import get_session
+
+@app.route("/api/test/fire-alert", methods=["POST"])
+@jwt_required()
+def fire_test_alert():
+    """
+    Insert a synthetic incident + alert and emit a 'violence_alert' SocketIO
+    event. Body (optional):
+      { type?: "violent"|"threatening", severity?: low|medium|high|critical,
+        confidence?: 0.0-1.0 }
+    """
+    data = request.get_json(silent=True) or {}
+    kind = data.get("type", "violent")
+    severity = data.get("severity", "high")
+    confidence = float(data.get("confidence", 0.85))
+
+    session = get_session()
+    try:
+        stream = session.query(Stream).filter_by(stream_id="CAM_DEMO").first()
+        if not stream:
+            stream = Stream(
+                stream_id="CAM_DEMO",
+                name="Demo Camera",
+                source_url="0",
+                location="Lab / FYP demo",
+                is_active=True,
+            )
+            session.add(stream)
+            session.commit()
+
+        now = datetime.utcnow()
+        # Unique code per fire so we don't collide
+        code = f"INC-LIVE-{int(now.timestamp())}"
+
+        incident = Incident(
+            incident_code=code,
+            stream_id=stream.stream_id,
+            type=kind,
+            confidence=confidence,
+            timestamp=now,
+            location=stream.location,
+            severity=severity,
+            status="open",
+            notes="Manually triggered via /api/test/fire-alert",
+        )
+        session.add(incident)
+        session.flush()
+
+        alert = Alert(
+            incident_id=incident.id,
+            type=kind,
+            confidence=confidence,
+            timestamp=now,
+            acknowledged=False,
+            dismissed=False,
+        )
+        session.add(alert)
+        session.commit()
+
+        payload = alert.to_dict()
+        socketio.emit("violence_alert", payload)
+        logger.info("Fired test alert id=%s severity=%s", alert.id, severity)
+        return jsonify(payload), 201
+    finally:
+        session.close()
 
 
 # ==================== DB BOOT ====================
@@ -151,7 +229,11 @@ if __name__ == "__main__":
     print("    GET   /api/incidents                       ?status&severity&limit&offset")
     print("    GET   /api/incidents/<id>")
     print("    PATCH /api/incidents/<id>                  manage role; body: { status?, severity?, notes? }")
+    print("    POST  /api/test/fire-alert                 JWT; manually emit a violence_alert event")
     print("    GET   /health")
+    print()
+    print("  WebSocket: ws://localhost:%d/socket.io" % port)
+    print("    Listen for: 'violence_alert', 'stats_update'")
     print()
     print("  Demo users (seeded automatically):")
     print("    superadmin@example.com / superadmin123")
@@ -161,4 +243,6 @@ if __name__ == "__main__":
     print("  Ctrl+C to stop.")
     print("=" * 60)
     print()
-    app.run(host=host, port=port, debug=False)
+    # Use socketio.run so the WebSocket transport is properly initialized
+    # alongside the HTTP server.
+    socketio.run(app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)
