@@ -43,11 +43,36 @@ app.config['SECRET_KEY'] = WebConfig.SECRET_KEY
 app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', WebConfig.SECRET_KEY)
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = False  # No expiry for dev; set timedelta in prod
 
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+_cors_origins = WebConfig.CORS_ORIGINS
+_cors_value = "*" if _cors_origins.strip() == "*" else [o.strip() for o in _cors_origins.split(",") if o.strip()]
+CORS(app, resources={r"/*": {"origins": _cors_value}}, supports_credentials=True)
+socketio = SocketIO(app, cors_allowed_origins=_cors_value, async_mode='threading')
 jwt = JWTManager(app)
 
 app.register_blueprint(auth_bp)
+
+
+# ==================== ERROR HANDLERS ====================
+# Normalize all error responses to the shape the FE expects:
+#   { "errors": { "<field>": ["message", ...] } }
+# Use "_" as the field for non-validation / generic errors.
+
+@app.errorhandler(Exception)
+def _handle_uncaught(e):
+    code = getattr(e, "code", 500)
+    msg = getattr(e, "description", None) or str(e) or "Internal Server Error"
+    logger.exception("Unhandled error on %s %s", request.method, request.path)
+    return jsonify({"errors": {"_": [msg]}}), code
+
+
+@app.errorhandler(404)
+def _handle_404(e):
+    return jsonify({"errors": {"_": [getattr(e, "description", None) or "Not Found"]}}), 404
+
+
+@app.errorhandler(405)
+def _handle_405(e):
+    return jsonify({"errors": {"_": [getattr(e, "description", None) or "Method Not Allowed"]}}), 405
 
 # Initialise database (SQLite by default; set DATABASE_URL env var for PostgreSQL)
 init_db()
