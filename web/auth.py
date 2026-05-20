@@ -128,6 +128,17 @@ def me():
     })
 
 
+@auth_bp.route('/logout', methods=['POST'])
+def logout():
+    """
+    Stateless logout. JWT is held client-side and dropped by the FE;
+    nothing to invalidate server-side until refresh-token rotation lands
+    (Phase 6 / hardening). Returning a body so the FE can confirm the
+    round-trip succeeded.
+    """
+    return jsonify({'ok': True})
+
+
 # ---------------------------------------------------------------------------
 # Helper used by protected app.py routes
 # ---------------------------------------------------------------------------
