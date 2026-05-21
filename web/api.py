@@ -17,7 +17,7 @@ Response shapes:
 
 from datetime import datetime
 from flask import Blueprint, jsonify, request
-from flask_jwt_extended import jwt_required, get_jwt_identity, verify_jwt_in_request
+from flask_jwt_extended import jwt_required, get_jwt, get_jwt_identity, verify_jwt_in_request
 
 from database.db import get_session
 from database.models import Alert, Incident, Stream
@@ -39,14 +39,17 @@ _ALLOWED_INCIDENT_SEVERITIES = {"low", "medium", "high", "critical"}
 def _require_manage_role():
     """
     Verify JWT and check the caller's role is admin/superadmin.
-    Returns (identity, None) on success, (None, error_response) on failure.
+    Returns (claims, None) on success, (None, error_response) on failure.
+
+    The JWT identity (sub) is a string user id; role / email / fullname
+    ride along as additional claims, read via get_jwt().
     """
     try:
         verify_jwt_in_request()
-        identity = get_jwt_identity()
-        if identity.get("user_type") not in _MANAGE_ROLES:
+        claims = get_jwt()
+        if claims.get("user_type") not in _MANAGE_ROLES:
             return None, (jsonify({"errors": {"_": ["Insufficient role"]}}), 403)
-        return identity, None
+        return claims, None
     except Exception as exc:
         return None, (jsonify({"errors": {"_": [f"Unauthorized: {exc}"]}}), 401)
 
@@ -122,7 +125,8 @@ def list_alerts():
 @api_bp.route("/alerts/<int:alert_id>/acknowledge", methods=["POST"])
 @jwt_required()
 def acknowledge_alert(alert_id):
-    identity = get_jwt_identity() or {}
+    # JWT identity (sub) is the string user id
+    user_id = get_jwt_identity()
     session = get_session()
     try:
         alert = session.query(Alert).get(alert_id)
@@ -130,7 +134,7 @@ def acknowledge_alert(alert_id):
             return jsonify({"errors": {"_": ["Alert not found"]}}), 404
         alert.acknowledged = True
         try:
-            alert.acknowledged_by = int(identity.get("id")) if identity.get("id") else None
+            alert.acknowledged_by = int(user_id) if user_id else None
         except (TypeError, ValueError):
             alert.acknowledged_by = None
         alert.acknowledged_at = datetime.utcnow()
