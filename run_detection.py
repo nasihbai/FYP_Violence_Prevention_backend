@@ -68,12 +68,23 @@ def run_detection(args):
     logger.info(f"Video source: {args.source}")
     logger.info(f"YOLO enabled: {not args.no_yolo}")
 
-    # Initialize detector
+    # Initialize detector. Pull defaults from ModelConfig (env-overridable)
+    # when a CLI lever isn't given, mirroring the web-dashboard path.
     detector = ThreadSafeDetector(
         lstm_model_path=model_path,
         use_yolo=not args.no_yolo,
         violence_threshold=args.threshold,
-        warmup_frames=args.warmup
+        warmup_frames=args.warmup,
+        yolo_model=args.yolo_model or ModelConfig.YOLO_MODEL,
+        yolo_confidence=(args.yolo_confidence
+                         if args.yolo_confidence is not None
+                         else ModelConfig.YOLO_CONFIDENCE),
+        sequence_length=args.sequence_length or ModelConfig.LSTM_SEQUENCE_LENGTH,
+        classifier_mode=args.classifier_mode or ModelConfig.CLASSIFIER_MODE,
+        video_classifier_model=(args.video_classifier_model
+                                or ModelConfig.VIDEO_CLASSIFIER_MODEL),
+        clip_length=args.clip_length or ModelConfig.VIDEO_CLIP_LENGTH,
+        clip_stride=args.clip_stride or ModelConfig.VIDEO_CLIP_STRIDE,
     )
 
     # Initialize alert manager
@@ -153,6 +164,10 @@ def run_web_dashboard(args):
             yolo_model=args.yolo_model,
             yolo_confidence=args.yolo_confidence,
             sequence_length=args.sequence_length,
+            classifier_mode=args.classifier_mode,
+            video_classifier_model=args.video_classifier_model,
+            clip_length=args.clip_length,
+            clip_stride=args.clip_stride,
         )
 
     run_server(host=args.host, port=args.port, debug=args.debug, use_reloader=reload)
@@ -198,6 +213,35 @@ Examples:
         type=int,
         default=None,
         help='LSTM sequence length in frames (lower = classifies sooner)'
+    )
+
+    # Scene-level video-clip classifier (pretrained VideoMAE)
+    parser.add_argument(
+        '--classifier-mode',
+        type=str,
+        default=None,
+        choices=['pose_lstm', 'video_clip', 'both'],
+        help="Which classifier path to use: 'pose_lstm' (legacy per-person "
+             "LSTM), 'video_clip' (scene-level VideoMAE; default), or 'both'"
+    )
+    parser.add_argument(
+        '--video-classifier-model',
+        type=str,
+        default=None,
+        help='HuggingFace model id for the scene classifier '
+             '(default MCG-NJU/videomae-base-finetuned-kinetics)'
+    )
+    parser.add_argument(
+        '--clip-length',
+        type=int,
+        default=None,
+        help='Number of frames the scene classifier sees per clip (default 16)'
+    )
+    parser.add_argument(
+        '--clip-stride',
+        type=int,
+        default=None,
+        help='Classify the scene every N frames (higher = less CPU)'
     )
 
     # Model

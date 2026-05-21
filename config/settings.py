@@ -72,6 +72,18 @@ class ModelConfig:
     VIOLENCE_THRESHOLD = float(os.environ.get("VIOLENCE_THRESHOLD", "0.6"))
     DETECTION_SMOOTHING_WINDOW = 5  # Number of predictions to average
 
+    # Scene-level video-clip classifier (pretrained VideoMAE).
+    # CLASSIFIER_MODE selects which path is active:
+    #   'video_clip' — scene-level VideoMAE only (default; recommended)
+    #   'pose_lstm'  — per-person LSTM only (legacy baseline)
+    #   'both'       — run both and OR the violence verdict
+    CLASSIFIER_MODE = os.environ.get("CLASSIFIER_MODE", "video_clip")
+    VIDEO_CLASSIFIER_MODEL = os.environ.get(
+        "VIDEO_CLASSIFIER_MODEL", "MCG-NJU/videomae-base-finetuned-kinetics"
+    )
+    VIDEO_CLIP_LENGTH = int(os.environ.get("VIDEO_CLIP_LENGTH", "16"))
+    VIDEO_CLIP_STRIDE = int(os.environ.get("VIDEO_CLIP_STRIDE", "8"))
+
 # =============================================================================
 # DETECTION CONFIGURATION
 # =============================================================================

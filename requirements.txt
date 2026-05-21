@@ -27,6 +27,18 @@ mediapipe==0.10.14
 # YOLO Object Detection (Multi-person detection)
 ultralytics>=8.0.0
 
+# Pretrained Video-Clip Violence Classifier (HuggingFace VideoMAE).
+# transformers 4.45.2 is tested against the pinned TF 2.17 + protobuf<5
+# combo above; newer transformers releases force protobuf>=5 and break
+# the chain. torch is required because VideoMAE has no TF implementation
+# in HF (PyTorch-only); the CPU build is sufficient for FYP-scale inference.
+# torch lower-bound matches what the local venv already has installed
+# (and what torchvision/ultralytics expect); pinning down to 2.4 caused
+# a torchvision conflict so we keep the looser >=2.4 here.
+transformers==4.45.2
+torch>=2.4
+pillow>=10.0
+
 # Scientific Computing
 numpy>=1.23.0,<2.0.0
 scipy>=1.10.0

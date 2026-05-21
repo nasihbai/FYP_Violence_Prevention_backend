@@ -101,11 +101,16 @@ stats = {
 
 def initialize_detector(model_path: str = None, source=0, use_yolo: bool = True,
                         yolo_model: str = None, yolo_confidence: float = None,
-                        sequence_length: int = None):
+                        sequence_length: int = None,
+                        classifier_mode: str = None,
+                        video_classifier_model: str = None,
+                        clip_length: int = None,
+                        clip_stride: int = None):
     """
     Initialise the detection system.
 
-    The detector "levers" — yolo_model, yolo_confidence, sequence_length —
+    The detector "levers" — yolo_model, yolo_confidence, sequence_length,
+    classifier_mode, video_classifier_model, clip_length, clip_stride —
     fall back to config.ModelConfig (which is itself env-overridable) when
     not given. run_detection.py passes CLI overrides through here.
     """
@@ -128,6 +133,10 @@ def initialize_detector(model_path: str = None, source=0, use_yolo: bool = True,
     resolved_yolo = yolo_model or ModelConfig.YOLO_MODEL
     resolved_conf = yolo_confidence if yolo_confidence is not None else ModelConfig.YOLO_CONFIDENCE
     resolved_seq = sequence_length or ModelConfig.LSTM_SEQUENCE_LENGTH
+    resolved_mode = classifier_mode or ModelConfig.CLASSIFIER_MODE
+    resolved_video_model = video_classifier_model or ModelConfig.VIDEO_CLASSIFIER_MODEL
+    resolved_clip_length = clip_length or ModelConfig.VIDEO_CLIP_LENGTH
+    resolved_clip_stride = clip_stride or ModelConfig.VIDEO_CLIP_STRIDE
 
     detector = ThreadSafeDetector(
         lstm_model_path=model_path if model_path and Path(model_path).exists() else None,
@@ -136,11 +145,17 @@ def initialize_detector(model_path: str = None, source=0, use_yolo: bool = True,
         yolo_confidence=resolved_conf,
         sequence_length=resolved_seq,
         violence_threshold=ModelConfig.VIOLENCE_THRESHOLD,
+        classifier_mode=resolved_mode,
+        video_classifier_model=resolved_video_model,
+        clip_length=resolved_clip_length,
+        clip_stride=resolved_clip_stride,
     )
     detector.start()
     logger.info(
-        f"Detector initialised — source: {source} | YOLO: {resolved_yolo} "
-        f"@ conf {resolved_conf} | sequence_length: {resolved_seq} | "
+        f"Detector initialised — source: {source} | mode: {resolved_mode} | "
+        f"YOLO: {resolved_yolo} @ conf {resolved_conf} | "
+        f"video_model: {resolved_video_model} (clip {resolved_clip_length}/"
+        f"{resolved_clip_stride}) | sequence_length: {resolved_seq} | "
         f"violence_threshold: {ModelConfig.VIOLENCE_THRESHOLD}"
     )
 

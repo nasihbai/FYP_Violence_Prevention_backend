@@ -60,7 +60,11 @@ class ThreadSafeDetector:
         violence_threshold: float = 0.6,
         smoothing_window: int = 5,
         warmup_frames: int = 30,
-        yolo_confidence: float = 0.5
+        yolo_confidence: float = 0.5,
+        classifier_mode: str = "video_clip",
+        video_classifier_model: str = "MCG-NJU/videomae-base-finetuned-kinetics",
+        clip_length: int = 16,
+        clip_stride: int = 8,
     ):
         """
         Initialize detector.
@@ -74,16 +78,32 @@ class ThreadSafeDetector:
             smoothing_window: Window size for prediction smoothing
             warmup_frames: Frames to skip at start
             yolo_confidence: YOLO person-detection confidence threshold
+            classifier_mode: 'pose_lstm' (per-person LSTM, legacy baseline),
+                'video_clip' (scene-level VideoMAE, default), or
+                'both' (run both and OR the violence verdict).
+            video_classifier_model: HuggingFace model id for the scene classifier.
+            clip_length: Number of consecutive frames the scene classifier sees.
+            clip_stride: Classify the scene every `clip_stride` frames (lower =
+                more reactive, higher = less CPU).
         """
+        if classifier_mode not in ("pose_lstm", "video_clip", "both"):
+            raise ValueError(
+                f"classifier_mode must be one of pose_lstm/video_clip/both, "
+                f"got {classifier_mode!r}"
+            )
         self.sequence_length = sequence_length
         self.violence_threshold = violence_threshold
         self.smoothing_window = smoothing_window
         self.warmup_frames = warmup_frames
         self.yolo_confidence = yolo_confidence
+        self.classifier_mode = classifier_mode
+        self.clip_length = clip_length
+        self.clip_stride = max(1, clip_stride)
 
         # Thread synchronization
         self._lock = threading.RLock()
         self._prediction_queue = queue.Queue(maxsize=10)
+        self._scene_prediction_queue = queue.Queue(maxsize=2)
         self._result_cache: Dict[int, DetectionResult] = {}
         self._prediction_history: Dict[int, deque] = {}
 
@@ -97,20 +117,36 @@ class ThreadSafeDetector:
         self.pose_extractor = None
         self.lstm_classifier = None
         self.yolo_detector = None
+        self.video_classifier = None
+        self.clip_buffer = None
         self.use_yolo = use_yolo
+
+        # Scene-level (video_clip mode) result, broadcast to all detections.
+        from .scene_classifier import SceneResult
+        self._scene_result = SceneResult(
+            is_violent=False, confidence=0.0, label="neutral", timestamp=0.0
+        )
 
         # FPS calculation
         self._fps_history = deque(maxlen=30)
         self._last_frame_time = time.time()
 
         # Initialize components
-        self._initialize_components(lstm_model_path, yolo_model)
+        self._initialize_components(
+            lstm_model_path, yolo_model, video_classifier_model
+        )
 
-    def _initialize_components(self, lstm_model_path: Optional[str], yolo_model: str):
+    def _initialize_components(
+        self,
+        lstm_model_path: Optional[str],
+        yolo_model: str,
+        video_classifier_model: str,
+    ):
         """Initialize detection components."""
         from .pose_extractor import PoseExtractor, LandmarkBuffer
 
-        # Initialize pose extractor
+        # Pose extractor + landmark buffer are needed for the pose_lstm
+        # path and for skeleton drawing — keep them in all modes.
         self.pose_extractor = PoseExtractor()
         self.landmark_buffer = LandmarkBuffer(sequence_length=self.sequence_length)
 
@@ -131,45 +167,84 @@ class ThreadSafeDetector:
                 logger.warning(f"YOLO initialization failed: {e}")
                 self.use_yolo = False
 
-        # Initialize LSTM classifier
-        if lstm_model_path and Path(lstm_model_path).exists():
-            try:
-                from .lstm_model import ViolenceClassifier
-                self.lstm_classifier = ViolenceClassifier(
-                    model_path=lstm_model_path,
-                    sequence_length=self.sequence_length,
-                    smoothing_window=self.smoothing_window,
-                    threshold=self.violence_threshold
+        # Initialize LSTM classifier (only when its mode needs it).
+        if self.classifier_mode in ("pose_lstm", "both"):
+            if lstm_model_path and Path(lstm_model_path).exists():
+                try:
+                    from .lstm_model import ViolenceClassifier
+                    self.lstm_classifier = ViolenceClassifier(
+                        model_path=lstm_model_path,
+                        sequence_length=self.sequence_length,
+                        smoothing_window=self.smoothing_window,
+                        threshold=self.violence_threshold
+                    )
+                    logger.info(f"LSTM classifier loaded from {lstm_model_path}")
+                except Exception as e:
+                    logger.error(f"Failed to load LSTM model: {e}")
+            else:
+                logger.warning(
+                    f"classifier_mode={self.classifier_mode!r} requested LSTM "
+                    f"but no model file at {lstm_model_path!r}"
                 )
-                logger.info(f"LSTM classifier loaded from {lstm_model_path}")
+
+        # Initialize scene-level video classifier (only when its mode needs it).
+        if self.classifier_mode in ("video_clip", "both"):
+            try:
+                from .scene_classifier import ClipBuffer, VideoMAESceneClassifier
+                self.video_classifier = VideoMAESceneClassifier(
+                    model_name=video_classifier_model,
+                    threshold=self.violence_threshold,
+                )
+                self.clip_buffer = ClipBuffer(length=self.clip_length)
+                logger.info(
+                    f"Scene classifier ready — model={video_classifier_model}, "
+                    f"clip_length={self.clip_length}, stride={self.clip_stride}"
+                )
             except Exception as e:
-                logger.error(f"Failed to load LSTM model: {e}")
+                logger.error(f"Failed to load video classifier: {e}")
+                if self.classifier_mode == "video_clip":
+                    raise   # no fallback in pure scene mode
 
     def start(self, num_workers: int = 2):
         """Start prediction worker threads."""
         self._running = True
 
-        for i in range(num_workers):
-            worker = threading.Thread(
-                target=self._prediction_worker,
-                name=f"PredictionWorker-{i}",
-                daemon=True
-            )
-            worker.start()
-            self._workers.append(worker)
+        # Pose-LSTM workers only when that path is active. In video_clip-only
+        # mode these threads would just sit idle on an empty queue.
+        if self.lstm_classifier is not None:
+            for i in range(num_workers):
+                worker = threading.Thread(
+                    target=self._prediction_worker,
+                    name=f"PredictionWorker-{i}",
+                    daemon=True
+                )
+                worker.start()
+                self._workers.append(worker)
+            logger.info(f"Started {num_workers} LSTM prediction workers")
 
-        logger.info(f"Started {num_workers} prediction workers")
+        # Scene-level worker — one thread is enough; VideoMAE inference is
+        # heavy and queue maxsize=2 already provides backpressure.
+        if self.video_classifier is not None:
+            scene_worker = threading.Thread(
+                target=self._scene_prediction_worker,
+                name="SceneClassifierWorker",
+                daemon=True,
+            )
+            scene_worker.start()
+            self._workers.append(scene_worker)
+            logger.info("Started scene classifier worker")
 
     def stop(self):
         """Stop prediction workers."""
         self._running = False
 
-        # Clear queue
-        while not self._prediction_queue.empty():
-            try:
-                self._prediction_queue.get_nowait()
-            except queue.Empty:
-                break
+        # Drain both queues so workers wake up and exit promptly.
+        for q in (self._prediction_queue, self._scene_prediction_queue):
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
 
         # Wait for workers
         for worker in self._workers:
@@ -221,6 +296,49 @@ class ThreadSafeDetector:
             except Exception as e:
                 logger.error(f"Prediction worker error: {e}")
 
+    def _scene_prediction_worker(self):
+        """
+        Worker thread for scene-level (video_clip) classification.
+
+        Pulls a frame stack off the scene queue, runs VideoMAE, and writes
+        the verdict into self._scene_result under the lock. process_frame
+        reads that result and broadcasts it to every DetectionResult.
+        """
+        from .scene_classifier import SceneResult
+
+        while self._running:
+            try:
+                frames = self._scene_prediction_queue.get(timeout=0.1)
+                if frames is None:
+                    continue
+
+                is_violent, prob, top_label, top3 = self.video_classifier.predict(frames)
+
+                with self._lock:
+                    self._scene_result = SceneResult(
+                        is_violent=is_violent,
+                        confidence=prob,
+                        label=top_label,
+                        timestamp=time.time(),
+                    )
+
+                # INFO-level so the user can diagnose without --debug. Shows
+                # the violence-prob (whitelist sum) and the actual top-3
+                # Kinetics predictions — if the top labels are violence-
+                # adjacent but the sum is below threshold, lower --threshold;
+                # if the top labels are unrelated, the whitelist may need
+                # expanding or the camera angle is too far/unusual.
+                top3_str = ", ".join(f"{lbl}={p:.2f}" for lbl, p in top3)
+                logger.info(
+                    f"scene: violence_prob={prob:.3f} (thr={self.violence_threshold}) "
+                    f"violent={is_violent} | top3: {top3_str}"
+                )
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Scene prediction worker error: {e}")
+
     def process_frame(self, frame: np.ndarray) -> FrameResult:
         """
         Process a single frame for violence detection.
@@ -244,6 +362,19 @@ class ThreadSafeDetector:
         fps = np.mean(self._fps_history) if self._fps_history else 0
 
         detections = []
+
+        # Feed the scene-level clip buffer every frame, and queue a snapshot
+        # every `clip_stride` frames. Producer-side only — the worker pulls
+        # snapshots off the queue and updates self._scene_result.
+        if self.clip_buffer is not None:
+            self.clip_buffer.add(frame)
+            if self._frame_count % self.clip_stride == 0:
+                snap = self.clip_buffer.snapshot()
+                if snap is not None:
+                    try:
+                        self._scene_prediction_queue.put_nowait(snap)
+                    except queue.Full:
+                        pass   # last verdict still applies until next slot
 
         # Skip warmup frames
         if self._frame_count <= self.warmup_frames:
@@ -331,7 +462,35 @@ class ThreadSafeDetector:
                         timestamp=current_time
                     ))
 
-        has_violence = any(d.is_violent for d in detections)
+        # In modes that include the scene classifier, broadcast the latest
+        # scene verdict onto every per-person DetectionResult. The scene
+        # label is the source of truth in 'video_clip' mode; in 'both' it
+        # ORs with the per-person LSTM verdict.
+        if self.video_classifier is not None and detections:
+            with self._lock:
+                scene = self._scene_result
+            if self.classifier_mode == "video_clip":
+                for det in detections:
+                    det.is_violent = scene.is_violent
+                    det.confidence = scene.confidence
+                    det.class_name = "violent" if scene.is_violent else "neutral"
+            else:   # both
+                for det in detections:
+                    det.is_violent = det.is_violent or scene.is_violent
+                    det.confidence = max(det.confidence, scene.confidence)
+                    det.class_name = "violent" if det.is_violent else "neutral"
+
+        # In pure-scene mode with no detected people, surface a frame-wide
+        # warning if the scene is violent (so alerts still fire when the
+        # camera is far/zoomed and YOLO misses everyone).
+        scene_only_violence = False
+        if (self.video_classifier is not None
+                and self.classifier_mode == "video_clip"
+                and not detections):
+            with self._lock:
+                scene_only_violence = self._scene_result.is_violent
+
+        has_violence = any(d.is_violent for d in detections) or scene_only_violence
 
         return FrameResult(
             frame=frame,
@@ -457,6 +616,7 @@ class ThreadSafeDetector:
 
     def reset(self):
         """Reset detector state."""
+        from .scene_classifier import SceneResult
         with self._lock:
             self._frame_count = 0
             self._result_cache.clear()
@@ -466,6 +626,12 @@ class ThreadSafeDetector:
 
             if self.lstm_classifier:
                 self.lstm_classifier.reset_history()
+
+            if self.clip_buffer is not None:
+                self.clip_buffer.clear()
+            self._scene_result = SceneResult(
+                is_violent=False, confidence=0.0, label="neutral", timestamp=0.0
+            )
 
     def get_stats(self) -> Dict:
         """Get detector statistics."""
