@@ -8,12 +8,15 @@
 # Core Deep Learning
 #
 # Version pins (DO NOT loosen without re-checking the protobuf chain):
-#   TensorFlow 2.19+ is compiled against protobuf 6.x; MediaPipe needs
-#   protobuf 4.x. No protobuf version satisfies both, so TF is capped at
-#   <2.19. TF 2.17 + MediaPipe 0.10.14 both accept protobuf 4.25.x.
-#   MediaPipe is pinned to 0.10.14 — newer releases removed the legacy
-#   mp.solutions API this project's pose_extractor.py depends on.
-tensorflow>=2.16.0,<2.19
+#   TensorFlow 2.19+ ships protobuf 6.x-generated code and enforces a
+#   strict gencode/runtime version check; MediaPipe needs protobuf 4.x.
+#   TF 2.17.x predates that check entirely (protobuf 4.25 gencode), so
+#   TF 2.17.1 + protobuf 4.25.x + MediaPipe 0.10.14 all coexist.
+#   Pinned EXACTLY (==) not as a range — pip's resolver kept a newer TF
+#   when given a range against an already-messy environment.
+#   MediaPipe 0.10.14 is the last release with the legacy mp.solutions
+#   API this project's core/pose_extractor.py depends on.
+tensorflow==2.17.1
 keras>=3.0.0
 protobuf>=4.25.3,<5
 
