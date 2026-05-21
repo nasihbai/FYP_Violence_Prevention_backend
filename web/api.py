@@ -15,13 +15,14 @@ Response shapes:
   - Errors:           { errors: { <field>: ["msg"] } } — matches the FE shape
 """
 
+import json
 from datetime import datetime
 from flask import Blueprint, current_app, jsonify, request
 from flask_jwt_extended import jwt_required, get_jwt, get_jwt_identity, verify_jwt_in_request
 from werkzeug.security import generate_password_hash
 
 from database.db import get_session
-from database.models import Alert, Incident, Stream, User
+from database.models import Alert, Incident, Stream, User, Setting
 
 api_bp = Blueprint("api", __name__, url_prefix="/api")
 
@@ -579,6 +580,97 @@ def delete_user(user_pk):
         user.is_active = False
         session.commit()
         return jsonify(user.to_dict())
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Settings (key-value config, grouped by namespace)
+# ---------------------------------------------------------------------------
+# Backs the superadmin settings pages. Manage role required.
+# Values are JSON-encoded in the DB so any JSON type round-trips.
+
+_ALLOWED_SETTING_NAMESPACES = {"app", "email", "seo"}
+
+
+def _decode_setting_value(raw):
+    """DB stores JSON-encoded strings; decode, tolerating legacy plain text."""
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return raw  # legacy / non-JSON value — return as-is
+
+
+@api_bp.route("/settings/<namespace>", methods=["GET"])
+def get_settings(namespace):
+    """Return all settings in a namespace as a flat { key: value } map."""
+    _, err = _require_manage_role()
+    if err:
+        return err
+    if namespace not in _ALLOWED_SETTING_NAMESPACES:
+        return jsonify({"errors": {"_": [f"Unknown namespace: {namespace}"]}}), 404
+
+    session = get_session()
+    try:
+        rows = session.query(Setting).filter_by(namespace=namespace).all()
+        return jsonify({r.key: _decode_setting_value(r.value) for r in rows})
+    finally:
+        session.close()
+
+
+@api_bp.route("/settings/<namespace>", methods=["PUT"])
+def put_settings(namespace):
+    """
+    Upsert settings in a namespace. Body is a flat { key: value } map;
+    each entry is created or updated. Keys not in the body are left alone.
+    """
+    _, err = _require_manage_role()
+    if err:
+        return err
+    if namespace not in _ALLOWED_SETTING_NAMESPACES:
+        return jsonify({"errors": {"_": [f"Unknown namespace: {namespace}"]}}), 404
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"errors": {"_": ["Body must be a JSON object of key/value pairs"]}}), 422
+
+    session = get_session()
+    try:
+        for key, value in data.items():
+            encoded = json.dumps(value)
+            row = session.query(Setting).filter_by(namespace=namespace, key=str(key)).first()
+            if row:
+                row.value = encoded
+                row.updated_at = datetime.utcnow()
+            else:
+                session.add(Setting(namespace=namespace, key=str(key), value=encoded))
+        session.commit()
+
+        rows = session.query(Setting).filter_by(namespace=namespace).all()
+        return jsonify({r.key: _decode_setting_value(r.value) for r in rows})
+    finally:
+        session.close()
+
+
+@api_bp.route("/settings/<namespace>/<key>", methods=["DELETE"])
+def delete_setting(namespace, key):
+    """Remove a single setting key from a namespace."""
+    _, err = _require_manage_role()
+    if err:
+        return err
+    if namespace not in _ALLOWED_SETTING_NAMESPACES:
+        return jsonify({"errors": {"_": [f"Unknown namespace: {namespace}"]}}), 404
+
+    session = get_session()
+    try:
+        row = session.query(Setting).filter_by(namespace=namespace, key=key).first()
+        if not row:
+            return jsonify({"errors": {"_": ["Setting not found"]}}), 404
+        session.delete(row)
+        session.commit()
+        return jsonify({"ok": True})
     finally:
         session.close()
 

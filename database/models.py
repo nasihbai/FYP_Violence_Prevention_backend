@@ -9,7 +9,7 @@ SQLAlchemy ORM models — School Violence Prevention System
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, Text, Boolean,
-    ForeignKey, JSON,
+    ForeignKey, JSON, UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 from .db import Base
@@ -200,3 +200,38 @@ class DetectionLog(Base):
 
     # Relationships
     stream = relationship('Stream', back_populates='detection_logs', foreign_keys=[stream_id])
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+class Setting(Base):
+    """
+    Key-value configuration store, grouped by namespace.
+
+    Backs the superadmin settings pages (namespace 'app' / 'email' / 'seo')
+    so their values persist server-side instead of in browser localStorage.
+    `value` holds a JSON-encoded string so any JSON type (string, bool,
+    number, object) round-trips.
+    """
+    __tablename__ = 'settings'
+
+    id         = Column(Integer,     primary_key=True, autoincrement=True)
+    namespace  = Column(String(50),  nullable=False)
+    key        = Column(String(100), nullable=False)
+    value      = Column(Text,        nullable=True)   # JSON-encoded
+    updated_at = Column(DateTime,    nullable=False,
+                        default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('namespace', 'key', name='uq_setting_namespace_key'),
+    )
+
+    def to_dict(self):
+        return {
+            'namespace':  self.namespace,
+            'key':        self.key,
+            'value':      self.value,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
