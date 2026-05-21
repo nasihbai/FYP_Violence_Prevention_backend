@@ -2,15 +2,27 @@
 # Violence Detection System - Dependencies
 # ===========================================
 # Install with: pip install -r requirements.txt
+# Requires Python 3.11 (3.13 has no wheels for this numpy/TF combo).
 # ===========================================
 
 # Core Deep Learning
-tensorflow>=2.16.0
+#
+# Version pins (DO NOT loosen without re-checking the protobuf chain):
+#   TensorFlow 2.19+ ships protobuf 6.x-generated code and enforces a
+#   strict gencode/runtime version check; MediaPipe needs protobuf 4.x.
+#   TF 2.17.x predates that check entirely (protobuf 4.25 gencode), so
+#   TF 2.17.1 + protobuf 4.25.x + MediaPipe 0.10.14 all coexist.
+#   Pinned EXACTLY (==) not as a range — pip's resolver kept a newer TF
+#   when given a range against an already-messy environment.
+#   MediaPipe 0.10.14 is the last release with the legacy mp.solutions
+#   API this project's core/pose_extractor.py depends on.
+tensorflow==2.17.1
 keras>=3.0.0
+protobuf>=4.25.3,<5
 
 # Computer Vision
 opencv-python>=4.5.5.64
-mediapipe>=0.10.5
+mediapipe==0.10.14
 
 # YOLO Object Detection (Multi-person detection)
 ultralytics>=8.0.0

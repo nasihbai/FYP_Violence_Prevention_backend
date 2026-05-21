@@ -30,7 +30,8 @@ from config import WebConfig, VideoConfig, AlertConfig
 from core.detection_engine import ThreadSafeDetector, FrameResult
 from database import init_db, User, Stream, Incident, Alert, DetectionLog
 from database.db import get_session
-from auth import auth_bp, require_manage_role, seed_demo_users
+from .auth import auth_bp, require_manage_role, seed_demo_users
+from .api import api_bp
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +44,37 @@ app.config['SECRET_KEY'] = WebConfig.SECRET_KEY
 app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', WebConfig.SECRET_KEY)
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = False  # No expiry for dev; set timedelta in prod
 
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+_cors_origins = WebConfig.CORS_ORIGINS
+_cors_value = "*" if _cors_origins.strip() == "*" else [o.strip() for o in _cors_origins.split(",") if o.strip()]
+CORS(app, resources={r"/*": {"origins": _cors_value}}, supports_credentials=True)
+socketio = SocketIO(app, cors_allowed_origins=_cors_value, async_mode='threading')
 jwt = JWTManager(app)
 
 app.register_blueprint(auth_bp)
+app.register_blueprint(api_bp)
+
+
+# ==================== ERROR HANDLERS ====================
+# Normalize all error responses to the shape the FE expects:
+#   { "errors": { "<field>": ["message", ...] } }
+# Use "_" as the field for non-validation / generic errors.
+
+@app.errorhandler(Exception)
+def _handle_uncaught(e):
+    code = getattr(e, "code", 500)
+    msg = getattr(e, "description", None) or str(e) or "Internal Server Error"
+    logger.exception("Unhandled error on %s %s", request.method, request.path)
+    return jsonify({"errors": {"_": [msg]}}), code
+
+
+@app.errorhandler(404)
+def _handle_404(e):
+    return jsonify({"errors": {"_": [getattr(e, "description", None) or "Not Found"]}}), 404
+
+
+@app.errorhandler(405)
+def _handle_405(e):
+    return jsonify({"errors": {"_": [getattr(e, "description", None) or "Method Not Allowed"]}}), 405
 
 # Initialise database (SQLite by default; set DATABASE_URL env var for PostgreSQL)
 init_db()
@@ -164,15 +191,11 @@ def _save_incident(det, screenshot_path: str = None) -> dict | None:
         session.add(alert)
         session.commit()
 
-        # Return shape expected by Vue monitoring store (FlaskViolenceAlert)
-        return {
-            'id':        alert.id,
-            'timestamp': alert.timestamp.isoformat(),
-            'person_id': int(det.person_id) if det.person_id is not None else None,
-            'confidence': confidence,
-            'severity':  severity,
-            'camera_id': stream.stream_id,
-        }
+        # Return the full Alert shape — identical to POST /api/test/fire-alert
+        # and to what the FE's Alert type + alerts store expect (incident_id,
+        # type, acknowledged, dismissed, ...). Built before the session closes
+        # so the alert.incident relationship can still lazy-load.
+        return alert.to_dict()
     except Exception as exc:
         session.rollback()
         logger.error(f"Failed to save incident: {exc}")
@@ -327,29 +350,6 @@ def get_stats():
     })
 
 
-@app.route('/api/alerts')
-def get_alerts():
-    """Return incident history — requires valid JWT."""
-    from flask_jwt_extended import verify_jwt_in_request
-    try:
-        verify_jwt_in_request()
-    except Exception:
-        return jsonify({'message': 'Unauthorized'}), 401
-
-    limit = request.args.get('limit', 50, type=int)
-    session = get_session()
-    try:
-        alerts = (
-            session.query(Alert)
-            .order_by(Alert.timestamp.desc())
-            .limit(limit)
-            .all()
-        )
-        return jsonify([a.to_dict() for a in alerts])
-    finally:
-        session.close()
-
-
 @app.route('/api/config', methods=['GET', 'POST'])
 def config():
     if request.method == 'GET':
@@ -433,8 +433,16 @@ def create_app(model_path: str = None, source=0, use_yolo: bool = True):
     return app
 
 
-def run_server(host: str = '0.0.0.0', port: int = 5000, debug: bool = False):
-    socketio.run(app, host=host, port=port, debug=debug)
+def run_server(host: str = '0.0.0.0', port: int = 5000, debug: bool = False,
+               use_reloader: bool = False):
+    socketio.run(
+        app,
+        host=host,
+        port=port,
+        debug=debug,
+        use_reloader=use_reloader,
+        allow_unsafe_werkzeug=True,  # dev server; fine for an FYP demo
+    )
 
 
 if __name__ == '__main__':

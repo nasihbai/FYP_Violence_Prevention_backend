@@ -168,6 +168,10 @@ class WebConfig:
     STREAM_QUALITY = 80  # JPEG quality (1-100)
     STREAM_FPS = 15
 
+    # CORS origins. Comma-separated list, or "*" for any origin.
+    # Override in dev via env: CORS_ORIGINS=http://localhost:3100
+    CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*")
+
 # =============================================================================
 # DATABASE CONFIGURATION
 # =============================================================================
