@@ -18,9 +18,10 @@ Response shapes:
 from datetime import datetime
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required, get_jwt, get_jwt_identity, verify_jwt_in_request
+from werkzeug.security import generate_password_hash
 
 from database.db import get_session
-from database.models import Alert, Incident, Stream
+from database.models import Alert, Incident, Stream, User
 
 api_bp = Blueprint("api", __name__, url_prefix="/api")
 
@@ -44,10 +45,23 @@ def _require_manage_role():
     The JWT identity (sub) is a string user id; role / email / fullname
     ride along as additional claims, read via get_jwt().
     """
+    return _require_role(_MANAGE_ROLES)
+
+
+def _require_superadmin():
+    """Verify JWT and require the superadmin role specifically."""
+    return _require_role({"superadmin"})
+
+
+def _require_role(allowed):
+    """
+    Shared role gate. `allowed` is a set of acceptable user_type values.
+    Returns (claims, None) on success, (None, error_response) on failure.
+    """
     try:
         verify_jwt_in_request()
         claims = get_jwt()
-        if claims.get("user_type") not in _MANAGE_ROLES:
+        if claims.get("user_type") not in allowed:
             return None, (jsonify({"errors": {"_": ["Insufficient role"]}}), 403)
         return claims, None
     except Exception as exc:
@@ -392,5 +406,178 @@ def update_incident(incident_id):
         incident.updated_at = datetime.utcnow()
         session.commit()
         return jsonify(incident.to_dict())
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Users
+# ---------------------------------------------------------------------------
+# All user routes are superadmin-only. DELETE is a soft delete — User.id is
+# the FK target for Incident.created_by and Alert.acknowledged_by, so a hard
+# delete would orphan history.
+
+_ALLOWED_USER_ROLES = {"superadmin", "admin", "user"}
+
+
+@api_bp.route("/users", methods=["GET"])
+def list_users():
+    """List users. Superadmin only. Query params: ?role= ?is_active=."""
+    _, err = _require_superadmin()
+    if err:
+        return err
+
+    role = request.args.get("role")
+    is_active = _parse_bool("is_active")
+
+    session = get_session()
+    try:
+        q = session.query(User)
+        if role:
+            q = q.filter(User.role == role)
+        if is_active is not None:
+            q = q.filter(User.is_active == is_active)
+        items = q.order_by(User.id.asc()).all()
+        return jsonify({
+            "items": [u.to_dict() for u in items],
+            "total": len(items),
+            "limit": len(items),
+            "offset": 0,
+        })
+    finally:
+        session.close()
+
+
+@api_bp.route("/users/<int:user_pk>", methods=["GET"])
+def get_user(user_pk):
+    _, err = _require_superadmin()
+    if err:
+        return err
+    session = get_session()
+    try:
+        user = session.query(User).get(user_pk)
+        if not user:
+            return jsonify({"errors": {"_": ["User not found"]}}), 404
+        return jsonify(user.to_dict())
+    finally:
+        session.close()
+
+
+@api_bp.route("/users", methods=["POST"])
+def create_user():
+    """
+    Create a user. Superadmin only.
+    Body: { username, email, password, role?, is_active? }
+    """
+    _, err = _require_superadmin()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    errors = {}
+    for field in ("username", "email", "password"):
+        if not str(data.get(field, "")).strip():
+            errors[field] = [f"{field} is required"]
+    role = (data.get("role") or "user").strip()
+    if role not in _ALLOWED_USER_ROLES:
+        errors["role"] = [f"Invalid role: {role}"]
+    if errors:
+        return jsonify({"errors": errors}), 422
+
+    username = data["username"].strip()
+    email = data["email"].strip().lower()
+
+    session = get_session()
+    try:
+        if session.query(User).filter_by(username=username).first():
+            return jsonify({"errors": {"username": ["Username already taken"]}}), 422
+        if session.query(User).filter_by(email=email).first():
+            return jsonify({"errors": {"email": ["Email already registered"]}}), 422
+
+        user = User(
+            username=username,
+            email=email,
+            password=generate_password_hash(data["password"]),
+            role=role,
+            is_active=bool(data.get("is_active", True)),
+        )
+        session.add(user)
+        session.commit()
+        return jsonify(user.to_dict()), 201
+    finally:
+        session.close()
+
+
+@api_bp.route("/users/<int:user_pk>", methods=["PATCH"])
+def update_user(user_pk):
+    """
+    Update a user. Superadmin only.
+    Body may include: username, email, password, role, is_active.
+    A password, if present, is re-hashed.
+    """
+    _, err = _require_superadmin()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    session = get_session()
+    try:
+        user = session.query(User).get(user_pk)
+        if not user:
+            return jsonify({"errors": {"_": ["User not found"]}}), 404
+
+        if "username" in data:
+            new_username = str(data["username"]).strip()
+            if not new_username:
+                return jsonify({"errors": {"username": ["username cannot be empty"]}}), 422
+            clash = session.query(User).filter(
+                User.username == new_username, User.id != user_pk
+            ).first()
+            if clash:
+                return jsonify({"errors": {"username": ["Username already taken"]}}), 422
+            user.username = new_username
+
+        if "email" in data:
+            new_email = str(data["email"]).strip().lower()
+            if not new_email:
+                return jsonify({"errors": {"email": ["email cannot be empty"]}}), 422
+            clash = session.query(User).filter(
+                User.email == new_email, User.id != user_pk
+            ).first()
+            if clash:
+                return jsonify({"errors": {"email": ["Email already registered"]}}), 422
+            user.email = new_email
+
+        if "role" in data:
+            if data["role"] not in _ALLOWED_USER_ROLES:
+                return jsonify({"errors": {"role": [f"Invalid role: {data['role']}"]}}), 422
+            user.role = data["role"]
+
+        if "is_active" in data:
+            user.is_active = bool(data["is_active"])
+
+        if data.get("password"):
+            user.password = generate_password_hash(data["password"])
+
+        session.commit()
+        return jsonify(user.to_dict())
+    finally:
+        session.close()
+
+
+@api_bp.route("/users/<int:user_pk>", methods=["DELETE"])
+def delete_user(user_pk):
+    """Soft-delete a user (set is_active=false). Superadmin only."""
+    _, err = _require_superadmin()
+    if err:
+        return err
+    session = get_session()
+    try:
+        user = session.query(User).get(user_pk)
+        if not user:
+            return jsonify({"errors": {"_": ["User not found"]}}), 404
+        user.is_active = False
+        session.commit()
+        return jsonify(user.to_dict())
     finally:
         session.close()
