@@ -59,7 +59,8 @@ class ThreadSafeDetector:
         sequence_length: int = 20,
         violence_threshold: float = 0.6,
         smoothing_window: int = 5,
-        warmup_frames: int = 30
+        warmup_frames: int = 30,
+        yolo_confidence: float = 0.5
     ):
         """
         Initialize detector.
@@ -72,11 +73,13 @@ class ThreadSafeDetector:
             violence_threshold: Threshold for violence detection
             smoothing_window: Window size for prediction smoothing
             warmup_frames: Frames to skip at start
+            yolo_confidence: YOLO person-detection confidence threshold
         """
         self.sequence_length = sequence_length
         self.violence_threshold = violence_threshold
         self.smoothing_window = smoothing_window
         self.warmup_frames = warmup_frames
+        self.yolo_confidence = yolo_confidence
 
         # Thread synchronization
         self._lock = threading.RLock()
@@ -117,9 +120,13 @@ class ThreadSafeDetector:
                 from .yolo_detector import YOLODetector
                 self.yolo_detector = YOLODetector(
                     model_path=yolo_model,
+                    confidence=self.yolo_confidence,
                     enable_tracking=True
                 )
-                logger.info("YOLO detector initialized")
+                logger.info(
+                    f"YOLO detector initialized — model={yolo_model}, "
+                    f"confidence={self.yolo_confidence}"
+                )
             except Exception as e:
                 logger.warning(f"YOLO initialization failed: {e}")
                 self.use_yolo = False

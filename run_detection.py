@@ -148,7 +148,12 @@ def run_web_dashboard(args):
     reload = getattr(args, 'reload', False)
     is_worker = os.environ.get('WERKZEUG_RUN_MAIN') == 'true'
     if not reload or is_worker:
-        initialize_detector(model_path, args.source, not args.no_yolo)
+        initialize_detector(
+            model_path, args.source, not args.no_yolo,
+            yolo_model=args.yolo_model,
+            yolo_confidence=args.yolo_confidence,
+            sequence_length=args.sequence_length,
+        )
 
     run_server(host=args.host, port=args.port, debug=args.debug, use_reloader=reload)
 
@@ -173,6 +178,26 @@ Examples:
         '--source', '-s',
         default=0,
         help='Video source: camera index (0,1,...), file path, or URL'
+    )
+
+    # Detector tuning levers (override config.ModelConfig / its env vars)
+    parser.add_argument(
+        '--yolo-model',
+        type=str,
+        default=None,
+        help='YOLO model: yolov8n.pt (fast) / yolov8s.pt / yolov8m.pt (accurate)'
+    )
+    parser.add_argument(
+        '--yolo-confidence',
+        type=float,
+        default=None,
+        help='YOLO person-detection confidence threshold, 0-1 (lower = more people)'
+    )
+    parser.add_argument(
+        '--sequence-length',
+        type=int,
+        default=None,
+        help='LSTM sequence length in frames (lower = classifies sooner)'
     )
 
     # Model

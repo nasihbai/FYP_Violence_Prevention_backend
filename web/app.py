@@ -26,7 +26,7 @@ from flask_jwt_extended import JWTManager
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config import WebConfig, VideoConfig, AlertConfig
+from config import WebConfig, VideoConfig, AlertConfig, ModelConfig
 from core.detection_engine import ThreadSafeDetector, FrameResult
 from database import init_db, User, Stream, Incident, Alert, DetectionLog
 from database.db import get_session
@@ -99,8 +99,16 @@ stats = {
 
 # ==================== HELPERS ====================
 
-def initialize_detector(model_path: str = None, source=0, use_yolo: bool = True):
-    """Initialise the detection system."""
+def initialize_detector(model_path: str = None, source=0, use_yolo: bool = True,
+                        yolo_model: str = None, yolo_confidence: float = None,
+                        sequence_length: int = None):
+    """
+    Initialise the detection system.
+
+    The detector "levers" — yolo_model, yolo_confidence, sequence_length —
+    fall back to config.ModelConfig (which is itself env-overridable) when
+    not given. run_detection.py passes CLI overrides through here.
+    """
     global detector, video_source
 
     video_source = source
@@ -116,12 +124,25 @@ def initialize_detector(model_path: str = None, source=0, use_yolo: bool = True)
         ]
         model_path = next((str(p) for p in candidates if p.exists()), None)
 
+    # Resolve the levers: explicit arg > ModelConfig (env-overridable) default
+    resolved_yolo = yolo_model or ModelConfig.YOLO_MODEL
+    resolved_conf = yolo_confidence if yolo_confidence is not None else ModelConfig.YOLO_CONFIDENCE
+    resolved_seq = sequence_length or ModelConfig.LSTM_SEQUENCE_LENGTH
+
     detector = ThreadSafeDetector(
-        lstm_model_path=model_path if Path(model_path).exists() else None,
+        lstm_model_path=model_path if model_path and Path(model_path).exists() else None,
         use_yolo=use_yolo,
+        yolo_model=resolved_yolo,
+        yolo_confidence=resolved_conf,
+        sequence_length=resolved_seq,
+        violence_threshold=ModelConfig.VIOLENCE_THRESHOLD,
     )
     detector.start()
-    logger.info(f"Detector initialised — source: {source}")
+    logger.info(
+        f"Detector initialised — source: {source} | YOLO: {resolved_yolo} "
+        f"@ conf {resolved_conf} | sequence_length: {resolved_seq} | "
+        f"violence_threshold: {ModelConfig.VIOLENCE_THRESHOLD}"
+    )
 
 
 def _get_or_create_stream(session, source) -> Stream:

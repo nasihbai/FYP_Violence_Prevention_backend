@@ -49,13 +49,17 @@ class VideoConfig:
 # =============================================================================
 class ModelConfig:
     # YOLO Configuration
-    YOLO_MODEL = "yolov8n.pt"  # Options: yolov8n.pt, yolov8s.pt, yolov8m.pt
-    YOLO_CONFIDENCE = 0.5
+    # All four detector "levers" are env-overridable so you can A/B test
+    # without editing code, e.g.:
+    #   YOLO_MODEL=yolov8s.pt YOLO_CONFIDENCE=0.3 python run_detection.py --web ...
+    # CLI flags on run_detection.py take precedence over these.
+    YOLO_MODEL = os.environ.get("YOLO_MODEL", "yolov8n.pt")  # yolov8n/s/m.pt
+    YOLO_CONFIDENCE = float(os.environ.get("YOLO_CONFIDENCE", "0.5"))
     YOLO_PERSON_CLASS = 0  # COCO class ID for person
 
     # LSTM Configuration
     LSTM_MODEL_PATH = BASE_DIR / "lstm-model.h5"
-    LSTM_SEQUENCE_LENGTH = 20  # Number of frames for temporal analysis
+    LSTM_SEQUENCE_LENGTH = int(os.environ.get("LSTM_SEQUENCE_LENGTH", "20"))
     LSTM_UNITS = 64
     LSTM_DROPOUT = 0.3
 
@@ -65,7 +69,7 @@ class ModelConfig:
     TOTAL_FEATURES = NUM_POSE_LANDMARKS * FEATURES_PER_LANDMARK  # 132
 
     # Detection thresholds
-    VIOLENCE_THRESHOLD = 0.6  # Confidence threshold for violence detection
+    VIOLENCE_THRESHOLD = float(os.environ.get("VIOLENCE_THRESHOLD", "0.6"))
     DETECTION_SMOOTHING_WINDOW = 5  # Number of predictions to average
 
 # =============================================================================
