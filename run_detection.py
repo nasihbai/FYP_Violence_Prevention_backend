@@ -141,8 +141,16 @@ def run_web_dashboard(args):
     logger.info(f"Model: {model_path}")
     logger.info(f"Source: {args.source}")
 
-    initialize_detector(model_path, args.source, not args.no_yolo)
-    run_server(host=args.host, port=args.port, debug=args.debug)
+    # With --reload, Werkzeug's reloader runs the script in two processes:
+    # a file-watching supervisor and the actual worker. Only the worker
+    # (WERKZEUG_RUN_MAIN=true) must initialize the detector — otherwise the
+    # camera gets opened twice and the second open fails.
+    reload = getattr(args, 'reload', False)
+    is_worker = os.environ.get('WERKZEUG_RUN_MAIN') == 'true'
+    if not reload or is_worker:
+        initialize_detector(model_path, args.source, not args.no_yolo)
+
+    run_server(host=args.host, port=args.port, debug=args.debug, use_reloader=reload)
 
 
 def main():
@@ -228,6 +236,11 @@ Examples:
         '--debug',
         action='store_true',
         help='Enable debug mode'
+    )
+    parser.add_argument(
+        '--reload',
+        action='store_true',
+        help='Auto-restart the web server when Python files change (dev only)'
     )
 
     args = parser.parse_args()

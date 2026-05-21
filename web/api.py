@@ -16,7 +16,7 @@ Response shapes:
 """
 
 from datetime import datetime
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 from flask_jwt_extended import jwt_required, get_jwt, get_jwt_identity, verify_jwt_in_request
 from werkzeug.security import generate_password_hash
 
@@ -579,5 +579,79 @@ def delete_user(user_pk):
         user.is_active = False
         session.commit()
         return jsonify(user.to_dict())
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Test / demo helper
+# ---------------------------------------------------------------------------
+
+@api_bp.route("/test/fire-alert", methods=["POST"])
+@jwt_required()
+def fire_test_alert():
+    """
+    Insert a synthetic incident + alert and emit a 'violence_alert' SocketIO
+    event. Lets the FE / demo trigger an alert on cue without real violence
+    to detect. Body (all optional):
+      { type?: "violent"|"threatening", severity?: low|medium|high|critical,
+        confidence?: 0.0-1.0 }
+    """
+    data = request.get_json(silent=True) or {}
+    kind = data.get("type", "violent")
+    severity = data.get("severity", "high")
+    try:
+        confidence = float(data.get("confidence", 0.85))
+    except (TypeError, ValueError):
+        confidence = 0.85
+
+    session = get_session()
+    try:
+        stream = session.query(Stream).filter_by(stream_id="CAM_DEMO").first()
+        if not stream:
+            stream = Stream(
+                stream_id="CAM_DEMO",
+                name="Demo Camera",
+                source_url="0",
+                location="Lab / FYP demo",
+                is_active=True,
+            )
+            session.add(stream)
+            session.commit()
+
+        now = datetime.utcnow()
+        incident = Incident(
+            incident_code=f"INC-LIVE-{int(now.timestamp())}",
+            stream_id=stream.stream_id,
+            type=kind,
+            confidence=confidence,
+            timestamp=now,
+            location=stream.location,
+            severity=severity,
+            status="open",
+            notes="Manually triggered via /api/test/fire-alert",
+        )
+        session.add(incident)
+        session.flush()
+
+        alert = Alert(
+            incident_id=incident.id,
+            type=kind,
+            confidence=confidence,
+            timestamp=now,
+            acknowledged=False,
+            dismissed=False,
+        )
+        session.add(alert)
+        session.commit()
+
+        payload = alert.to_dict()
+        # Emit over SocketIO. The instance is registered on the Flask app
+        # by flask-socketio's init_app — grab it via current_app so this
+        # blueprint route doesn't need a direct import of web/app.py.
+        socketio = current_app.extensions.get("socketio")
+        if socketio is not None:
+            socketio.emit("violence_alert", payload)
+        return jsonify(payload), 201
     finally:
         session.close()

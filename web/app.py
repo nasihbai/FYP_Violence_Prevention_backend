@@ -437,8 +437,16 @@ def create_app(model_path: str = None, source=0, use_yolo: bool = True):
     return app
 
 
-def run_server(host: str = '0.0.0.0', port: int = 5000, debug: bool = False):
-    socketio.run(app, host=host, port=port, debug=debug)
+def run_server(host: str = '0.0.0.0', port: int = 5000, debug: bool = False,
+               use_reloader: bool = False):
+    socketio.run(
+        app,
+        host=host,
+        port=port,
+        debug=debug,
+        use_reloader=use_reloader,
+        allow_unsafe_werkzeug=True,  # dev server; fine for an FYP demo
+    )
 
 
 if __name__ == '__main__':
