@@ -23,7 +23,7 @@ from werkzeug.security import generate_password_hash
 from sqlalchemy import func
 
 from database.db import get_session
-from database.models import Alert, Incident, Stream, User, Setting
+from database.models import Alert, Incident, Stream, User, Setting, DetectionLog
 
 api_bp = Blueprint("api", __name__, url_prefix="/api")
 
@@ -581,6 +581,45 @@ def delete_user(user_pk):
         user.is_active = False
         session.commit()
         return jsonify(user.to_dict())
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Detection logs
+# ---------------------------------------------------------------------------
+
+@api_bp.route("/detection-logs", methods=["GET"])
+@jwt_required()
+def list_detection_logs():
+    """
+    Recent DetectionLog rows (one per ~30 processed frames). Query params:
+      ?stream_id=  filter to one camera
+      ?limit=N     default 50, max 200
+      ?offset=M    default 0
+    """
+    limit = _parse_int("limit", 50, 1, 200)
+    offset = _parse_int("offset", 0, 0)
+    stream_id = request.args.get("stream_id")
+
+    session = get_session()
+    try:
+        q = session.query(DetectionLog)
+        if stream_id:
+            q = q.filter(DetectionLog.stream_id == stream_id)
+        total = q.count()
+        items = (
+            q.order_by(DetectionLog.timestamp.desc())
+            .limit(limit)
+            .offset(offset)
+            .all()
+        )
+        return jsonify({
+            "items": [d.to_dict() for d in items],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        })
     finally:
         session.close()
 

@@ -201,6 +201,16 @@ class DetectionLog(Base):
     # Relationships
     stream = relationship('Stream', back_populates='detection_logs', foreign_keys=[stream_id])
 
+    def to_dict(self):
+        return {
+            'id':                 self.id,
+            'stream_id':          self.stream_id,
+            'timestamp':          self.timestamp.isoformat() if self.timestamp else None,
+            'person_count':       self.person_count,
+            'processing_time_ms': self.processing_time_ms,
+            'detections':         self.detections,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Settings
