@@ -16,10 +16,11 @@ Response shapes:
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Blueprint, current_app, jsonify, request
 from flask_jwt_extended import jwt_required, get_jwt, get_jwt_identity, verify_jwt_in_request
 from werkzeug.security import generate_password_hash
+from sqlalchemy import func
 
 from database.db import get_session
 from database.models import Alert, Incident, Stream, User, Setting
@@ -580,6 +581,74 @@ def delete_user(user_pk):
         user.is_active = False
         session.commit()
         return jsonify(user.to_dict())
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Analytics
+# ---------------------------------------------------------------------------
+
+@api_bp.route("/analytics/incidents", methods=["GET"])
+def incident_analytics():
+    """
+    Aggregated incident stats for the analytics page. Manage role.
+    Returns counts grouped by day (last 30d), severity, status, type, camera.
+    """
+    _, err = _require_manage_role()
+    if err:
+        return err
+
+    session = get_session()
+    try:
+        total = session.query(Incident).count()
+
+        def _grouped(column, allowed):
+            """Count incidents grouped by `column`, seeded with allowed keys at 0."""
+            out = {k: 0 for k in allowed}
+            for value, count in (
+                session.query(column, func.count(Incident.id)).group_by(column).all()
+            ):
+                if value in out:
+                    out[value] = count
+            return out
+
+        by_severity = _grouped(Incident.severity, _ALLOWED_INCIDENT_SEVERITIES)
+        by_status = _grouped(Incident.status, _ALLOWED_INCIDENT_STATUSES)
+        by_type = _grouped(Incident.type, ("violent", "threatening"))
+
+        # by camera — every camera that has incidents, busiest first
+        by_camera = [
+            {"stream_id": sid, "count": count}
+            for sid, count in (
+                session.query(Incident.stream_id, func.count(Incident.id))
+                .group_by(Incident.stream_id)
+                .order_by(func.count(Incident.id).desc())
+                .all()
+            )
+        ]
+
+        # by day — last 30 days
+        cutoff = datetime.utcnow() - timedelta(days=30)
+        by_day = [
+            {"date": str(day), "count": count}
+            for day, count in (
+                session.query(func.date(Incident.timestamp), func.count(Incident.id))
+                .filter(Incident.timestamp >= cutoff)
+                .group_by(func.date(Incident.timestamp))
+                .order_by(func.date(Incident.timestamp))
+                .all()
+            )
+        ]
+
+        return jsonify({
+            "total": total,
+            "by_day": by_day,
+            "by_severity": by_severity,
+            "by_status": by_status,
+            "by_type": by_type,
+            "by_camera": by_camera,
+        })
     finally:
         session.close()
 
