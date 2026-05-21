@@ -191,15 +191,11 @@ def _save_incident(det, screenshot_path: str = None) -> dict | None:
         session.add(alert)
         session.commit()
 
-        # Return shape expected by Vue monitoring store (FlaskViolenceAlert)
-        return {
-            'id':        alert.id,
-            'timestamp': alert.timestamp.isoformat(),
-            'person_id': int(det.person_id) if det.person_id is not None else None,
-            'confidence': confidence,
-            'severity':  severity,
-            'camera_id': stream.stream_id,
-        }
+        # Return the full Alert shape — identical to POST /api/test/fire-alert
+        # and to what the FE's Alert type + alerts store expect (incident_id,
+        # type, acknowledged, dismissed, ...). Built before the session closes
+        # so the alert.incident relationship can still lazy-load.
+        return alert.to_dict()
     except Exception as exc:
         session.rollback()
         logger.error(f"Failed to save incident: {exc}")
