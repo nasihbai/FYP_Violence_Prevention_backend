@@ -20,7 +20,7 @@ from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required, get_jwt_identity, verify_jwt_in_request
 
 from database.db import get_session
-from database.models import Alert, Incident
+from database.models import Alert, Incident, Stream
 
 api_bp = Blueprint("api", __name__, url_prefix="/api")
 
@@ -211,6 +211,146 @@ def get_incident(incident_id):
         payload = incident.to_dict()
         payload["alerts"] = [a.to_dict() for a in incident.alerts]
         return jsonify(payload)
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Streams (cameras)
+# ---------------------------------------------------------------------------
+
+@api_bp.route("/streams", methods=["GET"])
+@jwt_required()
+def list_streams():
+    """
+    List camera streams. Query params:
+      ?is_active=true|false   (omit for all)
+    Returns the list envelope: { items, total, limit, offset }.
+    """
+    is_active = _parse_bool("is_active")
+    session = get_session()
+    try:
+        q = session.query(Stream)
+        if is_active is not None:
+            q = q.filter(Stream.is_active == is_active)
+        items = q.order_by(Stream.stream_id.asc()).all()
+        return jsonify({
+            "items": [s.to_dict() for s in items],
+            "total": len(items),
+            "limit": len(items),
+            "offset": 0,
+        })
+    finally:
+        session.close()
+
+
+@api_bp.route("/streams/<int:stream_pk>", methods=["GET"])
+@jwt_required()
+def get_stream(stream_pk):
+    session = get_session()
+    try:
+        stream = session.query(Stream).get(stream_pk)
+        if not stream:
+            return jsonify({"errors": {"_": ["Stream not found"]}}), 404
+        return jsonify(stream.to_dict())
+    finally:
+        session.close()
+
+
+@api_bp.route("/streams", methods=["POST"])
+def create_stream():
+    """
+    Register a new camera. Manage role required.
+    Body: { stream_id, name, source_url, location?, is_active? }
+    """
+    _, err = _require_manage_role()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    errors = {}
+    for field in ("stream_id", "name", "source_url"):
+        if not str(data.get(field, "")).strip():
+            errors[field] = [f"{field} is required"]
+    if errors:
+        return jsonify({"errors": errors}), 422
+
+    session = get_session()
+    try:
+        existing = session.query(Stream).filter_by(stream_id=data["stream_id"].strip()).first()
+        if existing:
+            return jsonify({"errors": {"stream_id": ["A stream with this ID already exists"]}}), 422
+
+        stream = Stream(
+            stream_id=data["stream_id"].strip(),
+            name=data["name"].strip(),
+            source_url=str(data["source_url"]).strip(),
+            location=(data.get("location") or "").strip() or None,
+            is_active=bool(data.get("is_active", True)),
+        )
+        session.add(stream)
+        session.commit()
+        return jsonify(stream.to_dict()), 201
+    finally:
+        session.close()
+
+
+@api_bp.route("/streams/<int:stream_pk>", methods=["PATCH"])
+def update_stream(stream_pk):
+    """
+    Update a camera. Manage role required.
+    Body may include: name, source_url, location, is_active.
+    stream_id is immutable (it's the FK target for incidents/logs).
+    """
+    _, err = _require_manage_role()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    session = get_session()
+    try:
+        stream = session.query(Stream).get(stream_pk)
+        if not stream:
+            return jsonify({"errors": {"_": ["Stream not found"]}}), 404
+
+        if "name" in data:
+            if not str(data["name"]).strip():
+                return jsonify({"errors": {"name": ["name cannot be empty"]}}), 422
+            stream.name = data["name"].strip()
+        if "source_url" in data:
+            if not str(data["source_url"]).strip():
+                return jsonify({"errors": {"source_url": ["source_url cannot be empty"]}}), 422
+            stream.source_url = str(data["source_url"]).strip()
+        if "location" in data:
+            stream.location = (data.get("location") or "").strip() or None
+        if "is_active" in data:
+            stream.is_active = bool(data["is_active"])
+
+        session.commit()
+        return jsonify(stream.to_dict())
+    finally:
+        session.close()
+
+
+@api_bp.route("/streams/<int:stream_pk>", methods=["DELETE"])
+def delete_stream(stream_pk):
+    """
+    Soft-delete a camera (set is_active=false). Manage role required.
+    Hard delete is avoided — Stream.stream_id is the FK target for
+    incidents and detection logs; removing the row would orphan history.
+    """
+    _, err = _require_manage_role()
+    if err:
+        return err
+
+    session = get_session()
+    try:
+        stream = session.query(Stream).get(stream_pk)
+        if not stream:
+            return jsonify({"errors": {"_": ["Stream not found"]}}), 404
+        stream.is_active = False
+        session.commit()
+        return jsonify(stream.to_dict())
     finally:
         session.close()
 
