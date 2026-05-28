@@ -182,6 +182,39 @@ class DatabaseConfig:
     URL = "sqlite:///violence_detection.db"
 
 # =============================================================================
+# VIDEOMAE CONFIGURATION
+# =============================================================================
+class VideoMAEConfig:
+    # Base HuggingFace model (used for initial download and as fallback)
+    BASE_MODEL = os.environ.get(
+        "VIDEOMAE_BASE_MODEL", "MCG-NJU/videomae-base-finetuned-kinetics"
+    )
+    # Fine-tuned checkpoint directory (saved by finetune_videomae.py).
+    # If this directory exists it takes priority over BASE_MODEL at inference time.
+    CHECKPOINT_PATH = Path(
+        os.environ.get("VIDEOMAE_CHECKPOINT", str(MODELS_DIR / "violence_videomae"))
+    )
+    # Inference settings
+    CLIP_LEN = int(os.environ.get("VIDEOMAE_CLIP_LEN", "16"))
+    CLIP_STRIDE = int(os.environ.get("VIDEOMAE_CLIP_STRIDE", "2"))  # sample every N frames
+    VIOLENCE_THRESHOLD = float(os.environ.get("VIDEOMAE_THRESHOLD", "0.65"))
+    SMOOTH_WINDOW = int(os.environ.get("VIDEOMAE_SMOOTH_WINDOW", "5"))
+    # Minimum number of persons YOLO must detect before scene violence can fire.
+    # A single person cannot be in a fight — this eliminates solo-motion false positives.
+    MIN_PERSONS_FOR_ALERT = int(os.environ.get("VIDEOMAE_MIN_PERSONS", "2"))
+    # Training settings
+    DATASET_PATH = Path(
+        os.environ.get(
+            "VIDEOMAE_DATASET",
+            str(BASE_DIR / "violenceDetectionDataset" / "Complete Dataset"),
+        )
+    )
+    TRAIN_EPOCHS = int(os.environ.get("VIDEOMAE_EPOCHS", "8"))
+    TRAIN_BATCH_SIZE = int(os.environ.get("VIDEOMAE_BATCH_SIZE", "2"))
+    TRAIN_LR = float(os.environ.get("VIDEOMAE_LR", "1e-4"))
+    TRAIN_SEED = 42
+
+# =============================================================================
 # LOGGING CONFIGURATION
 # =============================================================================
 class LogConfig:

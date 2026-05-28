@@ -38,6 +38,7 @@ class FrameResult:
     fps: float
     timestamp: float
     has_violence: bool = False
+    scene_violence_prob: float = 0.0  # VideoMAE scene-level probability
 
 
 class ThreadSafeDetector:
@@ -59,7 +60,9 @@ class ThreadSafeDetector:
         sequence_length: int = 20,
         violence_threshold: float = 0.6,
         smoothing_window: int = 5,
-        warmup_frames: int = 30
+        warmup_frames: int = 30,
+        use_scene_classifier: bool = True,
+        use_person_classifier: bool = False,
     ):
         """
         Initialize detector.
@@ -94,16 +97,22 @@ class ThreadSafeDetector:
         self.pose_extractor = None
         self.lstm_classifier = None
         self.yolo_detector = None
+        self.scene_classifier = None
+        self.person_classifier = None
         self.use_yolo = use_yolo
+        self._scene_violence_prob: float = 0.0
 
         # FPS calculation
         self._fps_history = deque(maxlen=30)
         self._last_frame_time = time.time()
 
         # Initialize components
-        self._initialize_components(lstm_model_path, yolo_model)
+        self._initialize_components(lstm_model_path, yolo_model, use_scene_classifier, use_person_classifier)
 
-    def _initialize_components(self, lstm_model_path: Optional[str], yolo_model: str):
+    def _initialize_components(
+        self, lstm_model_path: Optional[str], yolo_model: str,
+        use_scene_classifier: bool, use_person_classifier: bool
+    ):
         """Initialize detection components."""
         from .pose_extractor import PoseExtractor, LandmarkBuffer
 
@@ -137,6 +146,36 @@ class ThreadSafeDetector:
                 logger.info(f"LSTM classifier loaded from {lstm_model_path}")
             except Exception as e:
                 logger.error(f"Failed to load LSTM model: {e}")
+
+        # Initialize VideoMAE scene classifier
+        if use_scene_classifier:
+            try:
+                from .scene_classifier import VideoMAESceneClassifier
+                from config.settings import VideoMAEConfig
+                self.scene_classifier = VideoMAESceneClassifier(
+                    clip_len=VideoMAEConfig.CLIP_LEN,
+                    clip_stride=VideoMAEConfig.CLIP_STRIDE,
+                    threshold=VideoMAEConfig.VIOLENCE_THRESHOLD,
+                    smooth_window=VideoMAEConfig.SMOOTH_WINDOW,
+                )
+                logger.info("VideoMAE scene classifier loaded (mode: %s)", self.scene_classifier._mode)
+            except Exception as e:
+                logger.warning("VideoMAE scene classifier unavailable: %s", e)
+
+        # Initialize per-person crop classifier (experimental)
+        if use_person_classifier:
+            try:
+                from .person_classifier import PersonCropClassifier
+                from config.settings import VideoMAEConfig
+                ckpt = str(VideoMAEConfig.CHECKPOINT_PATH)
+                self.person_classifier = PersonCropClassifier(
+                    checkpoint=ckpt,
+                    clip_len=VideoMAEConfig.CLIP_LEN,
+                    threshold=VideoMAEConfig.VIOLENCE_THRESHOLD,
+                )
+                logger.info("Per-person crop classifier loaded")
+            except Exception as e:
+                logger.warning("Per-person crop classifier unavailable: %s", e)
 
     def start(self, num_workers: int = 2):
         """Start prediction worker threads."""
@@ -249,7 +288,8 @@ class ThreadSafeDetector:
 
         # Multi-person detection with YOLO
         if self.use_yolo and self.yolo_detector is not None:
-            person_detections = self.yolo_detector.detect(frame, extract_crops=False)
+            need_crops = self.person_classifier is not None
+            person_detections = self.yolo_detector.detect(frame, extract_crops=need_crops)
 
             for det in person_detections:
                 # Extract pose for this person
@@ -324,14 +364,48 @@ class ThreadSafeDetector:
                         timestamp=current_time
                     ))
 
-        has_violence = any(d.is_violent for d in detections)
+        # Person count gate — computed before any violence flags are applied.
+        # Violence requires interaction between people; a lone person cannot fight.
+        try:
+            from config.settings import VideoMAEConfig as _VMC
+            _min_persons = _VMC.MIN_PERSONS_FOR_ALERT
+        except Exception:
+            _min_persons = 2
+        enough_persons = len(detections) >= _min_persons
+
+        # Per-person crop classification.
+        # Always push crops to keep the temporal buffer warm, but only apply
+        # violence flags to DetectionResults when enough persons are present.
+        if self.person_classifier is not None and self.use_yolo:
+            self.person_classifier.push_crops(person_detections)
+            if enough_persons:
+                for det in detections:
+                    person_score = self.person_classifier.get_score(det.person_id)
+                    if person_score > 0:
+                        det.confidence = person_score
+                        det.is_violent = self.person_classifier.is_violent(det.person_id)
+                        det.class_name = 'violent' if det.is_violent else 'neutral'
+
+        # Scene-level classification via VideoMAE (runs on every frame, fires when clip ready)
+        if self.scene_classifier is not None:
+            prob = self.scene_classifier.push_frame(frame)
+            if prob is not None:
+                self._scene_violence_prob = prob
+
+        logger.info("persons=%d  enough=%s  scene_prob=%.3f", len(detections), enough_persons, self._scene_violence_prob)
+
+        has_violence = enough_persons and (
+            any(d.is_violent for d in detections)
+            or self._scene_violence_prob >= self.violence_threshold
+        )
 
         return FrameResult(
             frame=frame,
             detections=detections,
             fps=fps,
             timestamp=current_time,
-            has_violence=has_violence
+            has_violence=has_violence,
+            scene_violence_prob=self._scene_violence_prob,
         )
 
     def draw_results(
@@ -390,11 +464,14 @@ class ThreadSafeDetector:
                 annotated = self.pose_extractor.draw_landmarks(annotated, pose_lm)
 
         # Draw detections
+        scene_violent = result.scene_violence_prob >= self.violence_threshold
         for det in result.detections:
             x1, y1, x2, y2 = det.bbox
 
-            # Choose color based on status
-            if det.is_violent:
+            # Scene classifier overrides box colour when it detects violence —
+            # we can't identify *which* person is fighting at scene level, so
+            # all boxes go red to signal "someone in frame is fighting".
+            if det.is_violent or scene_violent:
                 color = (0, 0, 255)  # Red
                 thickness = 3
             else:
@@ -404,8 +481,11 @@ class ThreadSafeDetector:
             # Draw bounding box
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
 
-            # Draw label
-            label = f"ID:{det.person_id} {det.class_name} ({det.confidence:.2f})"
+            # Label: prefer scene score when it's the active signal
+            if scene_violent and not det.is_violent:
+                label = f"ID:{det.person_id} fight ({result.scene_violence_prob:.2f})"
+            else:
+                label = f"ID:{det.person_id} {det.class_name} ({det.confidence:.2f})"
             label_size, _ = cv2.getTextSize(
                 label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
             )
@@ -429,6 +509,16 @@ class ThreadSafeDetector:
                 (255, 255, 255),
                 2
             )
+
+        # Person count overlay — shows what the gate sees
+        cv2.putText(annotated, f"Persons: {len(result.detections)}", (10, 115),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
+
+        # Scene classifier probability overlay (always visible when classifier is active)
+        if self.scene_classifier is not None:
+            prob_text = f"Scene: {result.scene_violence_prob:.2f}"
+            color = (0, 0, 220) if result.scene_violence_prob >= self.violence_threshold else (180, 180, 180)
+            cv2.putText(annotated, prob_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         # Violence warning overlay
         if result.has_violence:

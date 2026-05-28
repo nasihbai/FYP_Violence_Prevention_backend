@@ -117,8 +117,10 @@ def initialize_detector(model_path: str = None, source=0, use_yolo: bool = True)
         model_path = next((str(p) for p in candidates if p.exists()), None)
 
     detector = ThreadSafeDetector(
-        lstm_model_path=model_path if Path(model_path).exists() else None,
+        lstm_model_path=model_path if model_path and Path(model_path).exists() else None,
         use_yolo=use_yolo,
+        use_scene_classifier=True,
+        use_person_classifier=False,
     )
     detector.start()
     logger.info(f"Detector initialised — source: {source}")

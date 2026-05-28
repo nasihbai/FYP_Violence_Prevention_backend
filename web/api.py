@@ -15,15 +15,40 @@ Response shapes:
   - Errors:           { errors: { <field>: ["msg"] } } — matches the FE shape
 """
 
+import io
 import json
+import logging
+import threading
 from datetime import datetime, timedelta
-from flask import Blueprint, current_app, jsonify, request
+from pathlib import Path
+from flask import Blueprint, current_app, jsonify, request, send_file
 from flask_jwt_extended import jwt_required, get_jwt, get_jwt_identity, verify_jwt_in_request
 from werkzeug.security import generate_password_hash
 from sqlalchemy import func
 
 from database.db import get_session
 from database.models import Alert, Incident, Stream, User, Setting, DetectionLog
+
+logger = logging.getLogger(__name__)
+
+# Lazy YOLO loader for the review screenshot endpoint — we only need it
+# on demand, not at import time, so the slim auth server stays fast.
+_yolo_lock = threading.Lock()
+_yolo_model = None
+
+def _get_yolo():
+    global _yolo_model
+    if _yolo_model is not None:
+        return _yolo_model
+    with _yolo_lock:
+        if _yolo_model is None:
+            try:
+                from ultralytics import YOLO
+                _yolo_model = YOLO("yolov8n.pt")
+            except Exception as exc:
+                logger.warning("YOLO unavailable for review screenshots: %s", exc)
+                _yolo_model = False  # sentinel so we don't retry every request
+    return _yolo_model
 
 api_bp = Blueprint("api", __name__, url_prefix="/api")
 
@@ -779,6 +804,205 @@ def delete_setting(namespace, key):
         session.delete(row)
         session.commit()
         return jsonify({"ok": True})
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Review / classification queue
+# ---------------------------------------------------------------------------
+# Human-in-the-loop workflow: supervisors view saved screenshots, confirm
+# real violence or mark as false positive, and export labelled data for
+# future retraining.
+
+@api_bp.route("/review/queue", methods=["GET"])
+@jwt_required()
+def review_queue():
+    """
+    Incidents that have a saved screenshot and are still pending review
+    (status = 'open' | 'investigating'). Paginated.
+      ?status=open|investigating  (default: both)
+      ?limit=N  (default 20, max 100)
+      ?offset=M (default 0)
+    """
+    limit = _parse_int("limit", 20, 1, 100)
+    offset = _parse_int("offset", 0, 0)
+    status_filter = request.args.get("status")
+
+    session = get_session()
+    try:
+        q = (
+            session.query(Incident)
+            .filter(Incident.screenshot_path.isnot(None))
+        )
+        if status_filter:
+            q = q.filter(Incident.status == status_filter)
+        else:
+            q = q.filter(Incident.status.in_(["open", "investigating"]))
+
+        total = q.count()
+        items = (
+            q.order_by(Incident.timestamp.desc())
+            .limit(limit)
+            .offset(offset)
+            .all()
+        )
+        return jsonify({
+            "items": [i.to_dict() for i in items],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        })
+    finally:
+        session.close()
+
+
+@api_bp.route("/review/<int:incident_id>/screenshot", methods=["GET"])
+@jwt_required(locations=["headers", "query_string"])
+def review_screenshot(incident_id):
+    """
+    Return the saved screenshot for an incident with YOLO person boxes
+    drawn on top. Falls back to the raw screenshot if YOLO is unavailable.
+    """
+    import cv2
+    import numpy as np
+
+    session = get_session()
+    try:
+        incident = session.query(Incident).get(incident_id)
+        if not incident:
+            return jsonify({"errors": {"_": ["Incident not found"]}}), 404
+        if not incident.screenshot_path:
+            return jsonify({"errors": {"_": ["No screenshot for this incident"]}}), 404
+
+        img_path = Path(incident.screenshot_path)
+        if not img_path.exists():
+            return jsonify({"errors": {"_": ["Screenshot file not found on disk"]}}), 404
+
+        frame = cv2.imread(str(img_path))
+        if frame is None:
+            return jsonify({"errors": {"_": ["Could not decode screenshot"]}}), 500
+
+        # Run YOLO person detection on the saved screenshot
+        yolo = _get_yolo()
+        if yolo and yolo is not False:
+            try:
+                results = yolo(frame, classes=[0], verbose=False)
+                for result in results:
+                    for box in result.boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                        conf = float(box.conf[0])
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 120, 255), 2)
+                        cv2.putText(
+                            frame,
+                            f"Person {conf:.2f}",
+                            (x1, max(y1 - 6, 0)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            (0, 120, 255),
+                            1,
+                            cv2.LINE_AA,
+                        )
+            except Exception as exc:
+                logger.warning("YOLO inference failed for review screenshot: %s", exc)
+
+        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        return send_file(
+            io.BytesIO(buf.tobytes()),
+            mimetype="image/jpeg",
+            as_attachment=False,
+        )
+    finally:
+        session.close()
+
+
+@api_bp.route("/review/<int:incident_id>/verdict", methods=["POST"])
+def review_verdict(incident_id):
+    """
+    Submit a classification verdict for one incident.
+    Manage role required.
+    Body: { verdict: "confirmed" | "false_positive", notes?: "..." }
+    Maps verdict → incident.status:
+      confirmed      → "resolved"
+      false_positive → "false_positive"
+    """
+    _, err = _require_manage_role()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    verdict = data.get("verdict")
+    if verdict not in ("confirmed", "false_positive"):
+        return jsonify({"errors": {"verdict": ["Must be 'confirmed' or 'false_positive'"]}}), 422
+
+    new_status = "resolved" if verdict == "confirmed" else "false_positive"
+
+    session = get_session()
+    try:
+        incident = session.query(Incident).get(incident_id)
+        if not incident:
+            return jsonify({"errors": {"_": ["Incident not found"]}}), 404
+
+        incident.status = new_status
+        if "notes" in data:
+            incident.notes = data["notes"]
+        incident.updated_at = datetime.utcnow()
+        session.commit()
+        return jsonify(incident.to_dict())
+    finally:
+        session.close()
+
+
+@api_bp.route("/review/export-training", methods=["GET"])
+def export_training_labels():
+    """
+    Export all reviewed incidents grouped by label for retraining.
+    Manage role required.
+    Returns:
+      {
+        confirmed:      [ { incident_code, screenshot_path, confidence, timestamp }, ... ],
+        false_positive: [ { ... }, ... ],
+        total_confirmed: N,
+        total_false_positive: N,
+      }
+    """
+    _, err = _require_manage_role()
+    if err:
+        return err
+
+    session = get_session()
+    try:
+        confirmed = (
+            session.query(Incident)
+            .filter(Incident.status == "resolved", Incident.screenshot_path.isnot(None))
+            .order_by(Incident.timestamp.desc())
+            .all()
+        )
+        false_positives = (
+            session.query(Incident)
+            .filter(Incident.status == "false_positive", Incident.screenshot_path.isnot(None))
+            .order_by(Incident.timestamp.desc())
+            .all()
+        )
+
+        def _row(inc):
+            return {
+                "id": inc.id,
+                "incident_code": inc.incident_code,
+                "screenshot_path": inc.screenshot_path,
+                "confidence": inc.confidence,
+                "severity": inc.severity,
+                "stream_id": inc.stream_id,
+                "timestamp": inc.timestamp.isoformat(),
+                "notes": inc.notes,
+            }
+
+        return jsonify({
+            "confirmed": [_row(i) for i in confirmed],
+            "false_positive": [_row(i) for i in false_positives],
+            "total_confirmed": len(confirmed),
+            "total_false_positive": len(false_positives),
+        })
     finally:
         session.close()
 

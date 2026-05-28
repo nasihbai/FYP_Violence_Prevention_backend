@@ -52,6 +52,14 @@ flask-jwt-extended>=4.5.0
 SQLAlchemy>=2.0.0
 psycopg2-binary>=2.9.0  # Only needed when using PostgreSQL (DATABASE_URL env var)
 
+# VideoMAE / Transformers (scene classification)
+# NOTE: torch itself must be installed separately with the CUDA wheel:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# The lines below install the HuggingFace stack and image helpers only.
+transformers>=4.40.0
+Pillow>=9.0.0
+accelerate>=0.26.0  # required by transformers for gradient checkpointing
+
 # Utilities
 tqdm>=4.64.0
 PyYAML>=6.0

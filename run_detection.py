@@ -73,7 +73,9 @@ def run_detection(args):
         lstm_model_path=model_path,
         use_yolo=not args.no_yolo,
         violence_threshold=args.threshold,
-        warmup_frames=args.warmup
+        warmup_frames=args.warmup,
+        use_scene_classifier=not args.no_scene_classifier,
+        use_person_classifier=not args.no_person_classifier,
     )
 
     # Initialize alert manager
@@ -188,6 +190,16 @@ Examples:
         '--no-yolo',
         action='store_true',
         help='Disable YOLO multi-person detection'
+    )
+    parser.add_argument(
+        '--no-scene-classifier',
+        action='store_true',
+        help='Disable VideoMAE scene-level violence classifier'
+    )
+    parser.add_argument(
+        '--no-person-classifier',
+        action='store_true',
+        help='Disable VideoMAE per-person crop classifier'
     )
     parser.add_argument(
         '--threshold', '-t',
