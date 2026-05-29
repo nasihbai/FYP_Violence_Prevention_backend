@@ -19,7 +19,7 @@ version: '3.9'
 #   DB user:          violence_user
 #   DB password:      violence_pass
 #   DB name:          violence_db
-#   pgAdmin login:    admin@fyp.local / admin123
+#   pgAdmin login:    admin@example.com / admin123
 #   pgAdmin server:   host=db  port=5432 (add manually on first login)
 
 services:
@@ -33,7 +33,7 @@ services:
       POSTGRES_USER: violence_user
       POSTGRES_PASSWORD: violence_pass
     ports:
-      - "5432:5432"          # reachable from the host for native backend/tools
+      - "5433:5432"          # 5432 taken by another project; host port 5433 → container 5432
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -93,7 +93,7 @@ services:
   # ── Adminer — quick data browser ─────────────────────────────────────────
   # Open http://localhost:8080
   #   System:   PostgreSQL
-  #   Server:   db
+  #   Server:   db          ← use the Docker service name, NOT localhost
   #   Username: violence_user
   #   Password: violence_pass
   #   Database: violence_db
@@ -110,7 +110,7 @@ services:
 
   # ── pgAdmin — full GUI with ERD diagram builder ───────────────────────────
   # Open http://localhost:5050
-  #   Login:    admin@fyp.local / admin123
+  #   Login:    admin@example.com / admin123
   #   To connect: Object > Register > Server
   #     Name: violence_db  Host: db  Port: 5432
   #     User: violence_user  Password: violence_pass
@@ -123,7 +123,7 @@ services:
     ports:
       - "5050:80"
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@fyp.local
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
       PGADMIN_DEFAULT_PASSWORD: admin123
     volumes:
       - pgadmin_data:/var/lib/pgadmin
