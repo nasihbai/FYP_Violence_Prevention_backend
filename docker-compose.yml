@@ -1,0 +1,91 @@
+version: '3.9'
+
+# ─── Violence Prevention System — Full Stack ──────────────────────────────────
+#
+# Three services:
+#   db       — PostgreSQL 16 (always runs via Docker)
+#   backend  — Flask API + SocketIO (port 5000)
+#   frontend — Vue 3 built into nginx (port 3001)
+#
+# Quick start:
+#   docker compose up --build
+#
+# Database only (run backend + frontend natively, e.g. for GPU detection):
+#   docker compose up db
+#
+# Credentials (change JWT_SECRET_KEY before any shared/demo deployment):
+#   DB user:     violence_user
+#   DB password: violence_pass
+#   DB name:     violence_db
+
+services:
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: violence_db
+      POSTGRES_USER: violence_user
+      POSTGRES_PASSWORD: violence_pass
+    ports:
+      - "5432:5432"          # reachable from the host for native backend/tools
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U violence_user -d violence_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Flask Backend ─────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://violence_user:violence_pass@db:5432/violence_db
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-dev-secret-change-in-prod}
+      CORS_ORIGINS: "http://localhost:3001"
+    ports:
+      - "5000:5000"
+    volumes:
+      # Mount trained model so the scene classifier can load it
+      - ./models:/app/models
+      # Persist alert screenshots across container restarts
+      - ./alerts:/app/alerts
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── Vue 3 Frontend (nginx) ────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ../Violence_Prevention_Frontend
+      dockerfile: Dockerfile
+      args:
+        # Baked into the JS bundle at build time — must match what the
+        # browser can reach (localhost:5000 because backend is on host port 5000)
+        VITE_API_URL: "http://localhost:5000"
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3001:80"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  postgres_data:
+    driver: local

@@ -19,6 +19,10 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+# Load .env before any config import reads os.environ
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent.parent / ".env")
+
 from flask import Flask, render_template, Response, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO

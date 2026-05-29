@@ -63,6 +63,7 @@ accelerate>=0.26.0  # required by transformers for gradient checkpointing
 # Utilities
 tqdm>=4.64.0
 PyYAML>=6.0
+python-dotenv>=1.0.0   # loads .env into os.environ at startup
 
 # Optional: Audio alerts on Linux (uncomment if needed)
 # pygame>=2.1.0

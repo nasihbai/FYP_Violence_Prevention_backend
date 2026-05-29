@@ -29,6 +29,10 @@ import argparse
 import logging
 from pathlib import Path
 
+# Load .env before any config imports read os.environ
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / ".env")
+
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 

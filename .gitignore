@@ -76,5 +76,9 @@ desktop.ini
 .vscode/
 .idea/
 
+# ─── Environment / secrets ───────────────────────────────────────────────────
+.env
+# Keep .env.example tracked so new developers know what vars to set
+
 # ─── Claude Code internal ────────────────────────────────────────────────────
 .claude/
