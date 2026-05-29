@@ -937,6 +937,8 @@ def review_verdict(incident_id):
 
     new_status = "resolved" if verdict == "confirmed" else "false_positive"
 
+    user_id = get_jwt_identity()
+
     session = get_session()
     try:
         incident = session.query(Incident).get(incident_id)
@@ -944,6 +946,11 @@ def review_verdict(incident_id):
             return jsonify({"errors": {"_": ["Incident not found"]}}), 404
 
         incident.status = new_status
+        incident.reviewed_at = datetime.utcnow()
+        try:
+            incident.reviewed_by = int(user_id) if user_id else None
+        except (TypeError, ValueError):
+            incident.reviewed_by = None
         if "notes" in data:
             incident.notes = data["notes"]
         incident.updated_at = datetime.utcnow()

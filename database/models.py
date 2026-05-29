@@ -35,6 +35,8 @@ class User(Base):
     # Relationships
     incidents_created    = relationship('Incident', back_populates='creator',
                                         foreign_keys='Incident.created_by')
+    incidents_reviewed   = relationship('Incident', back_populates='reviewer',
+                                        foreign_keys='Incident.reviewed_by')
     alerts_acknowledged  = relationship('Alert',    back_populates='acknowledger',
                                         foreign_keys='Alert.acknowledged_by')
 
@@ -99,6 +101,8 @@ class Incident(Base):
     stream_id       = Column(String(50),   ForeignKey('streams.stream_id'), nullable=False)
     type            = Column(String(20),   nullable=False)               # threatening | violent
     confidence      = Column(Float,        nullable=False)
+    scene_violence_score = Column(Float,   nullable=True)   # raw VideoMAE probability
+    person_count    = Column(Integer,      nullable=True)   # persons in frame at alert time
     timestamp       = Column(DateTime,     nullable=False, default=datetime.utcnow)
     location        = Column(String(100),  nullable=True)
     screenshot_path = Column(String(255),  nullable=True)
@@ -108,30 +112,38 @@ class Incident(Base):
     severity        = Column(String(20),   nullable=False, default='medium')  # low/medium/high/critical
     status          = Column(String(20),   nullable=False, default='open')    # open/investigating/resolved/false_positive
     created_by      = Column(Integer,      ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    reviewed_by     = Column(Integer,      ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    reviewed_at     = Column(DateTime,     nullable=True)
     created_at      = Column(DateTime,     nullable=False, default=datetime.utcnow)
     updated_at      = Column(DateTime,     nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # Relationships
-    stream   = relationship('Stream', back_populates='incidents', foreign_keys=[stream_id])
-    creator  = relationship('User',   back_populates='incidents_created', foreign_keys=[created_by])
-    alerts   = relationship('Alert',  back_populates='incident', cascade='all, delete-orphan')
+    stream    = relationship('Stream', back_populates='incidents', foreign_keys=[stream_id])
+    creator   = relationship('User',   back_populates='incidents_created', foreign_keys=[created_by])
+    reviewer  = relationship('User',   back_populates='incidents_reviewed', foreign_keys=[reviewed_by])
+    alerts    = relationship('Alert',  back_populates='incident', cascade='all, delete-orphan')
 
     def to_dict(self):
         return {
-            'id':             self.id,
-            'incident_code':  self.incident_code,
-            'stream_id':      self.stream_id,
-            'type':           self.type,
-            'confidence':     self.confidence,
-            'timestamp':      self.timestamp.isoformat(),
-            'location':       self.location,
-            'screenshot_path': self.screenshot_path,
-            'video_path':     self.video_path,
-            'severity':       self.severity,
-            'status':         self.status,
-            'notes':          self.notes,
-            'created_by':     self.created_by,
-            'created_at':     self.created_at.isoformat(),
+            'id':                   self.id,
+            'incident_code':        self.incident_code,
+            'stream_id':            self.stream_id,
+            'type':                 self.type,
+            'confidence':           self.confidence,
+            'scene_violence_score': self.scene_violence_score,
+            'person_count':         self.person_count,
+            'timestamp':            self.timestamp.isoformat(),
+            'location':             self.location,
+            'screenshot_path':      self.screenshot_path,
+            'video_path':           self.video_path,
+            'severity':             self.severity,
+            'status':               self.status,
+            'notes':                self.notes,
+            'created_by':           self.created_by,
+            'reviewed_by':          self.reviewed_by,
+            'reviewed_at':          self.reviewed_at.isoformat() if self.reviewed_at else None,
+            'created_at':           self.created_at.isoformat(),
+            'updated_at':           self.updated_at.isoformat() if self.updated_at else None,
         }
 
 
@@ -190,25 +202,29 @@ class DetectionLog(Base):
     """
     __tablename__ = 'detection_logs'
 
-    id                 = Column(Integer,  primary_key=True, autoincrement=True)
-    stream_id          = Column(String(50), ForeignKey('streams.stream_id', ondelete='CASCADE'), nullable=False)
-    timestamp          = Column(DateTime, nullable=False, default=datetime.utcnow)
-    person_count       = Column(Integer,  nullable=True, default=0)
-    detections         = Column(JSON,     nullable=True)  # JSONB in PostgreSQL, TEXT in SQLite
-    processing_time_ms = Column(Float,    nullable=True)
-    created_at         = Column(DateTime, nullable=False, default=datetime.utcnow)
+    id                   = Column(Integer,  primary_key=True, autoincrement=True)
+    stream_id            = Column(String(50), ForeignKey('streams.stream_id', ondelete='CASCADE'), nullable=False)
+    timestamp            = Column(DateTime, nullable=False, default=datetime.utcnow)
+    person_count         = Column(Integer,  nullable=True, default=0)
+    has_violence         = Column(Boolean,  nullable=False, default=False)
+    scene_violence_score = Column(Float,    nullable=True)   # VideoMAE probability at this batch
+    detections           = Column(JSON,     nullable=True)   # JSONB in PostgreSQL, TEXT in SQLite
+    processing_time_ms   = Column(Float,    nullable=True)
+    created_at           = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     # Relationships
     stream = relationship('Stream', back_populates='detection_logs', foreign_keys=[stream_id])
 
     def to_dict(self):
         return {
-            'id':                 self.id,
-            'stream_id':          self.stream_id,
-            'timestamp':          self.timestamp.isoformat() if self.timestamp else None,
-            'person_count':       self.person_count,
-            'processing_time_ms': self.processing_time_ms,
-            'detections':         self.detections,
+            'id':                   self.id,
+            'stream_id':            self.stream_id,
+            'timestamp':            self.timestamp.isoformat() if self.timestamp else None,
+            'person_count':         self.person_count,
+            'has_violence':         self.has_violence,
+            'scene_violence_score': self.scene_violence_score,
+            'processing_time_ms':   self.processing_time_ms,
+            'detections':           self.detections,
         }
 
 

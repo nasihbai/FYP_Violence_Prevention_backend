@@ -147,7 +147,12 @@ def _get_or_create_stream(session, source) -> Stream:
     return stream
 
 
-def _save_incident(det, screenshot_path: str = None) -> dict | None:
+def _save_incident(
+    det,
+    screenshot_path: str = None,
+    scene_violence_score: float = None,
+    person_count: int = None,
+) -> dict | None:
     """
     Persist a violence detection event.
     Creates: Stream (if needed) → Incident → Alert.
@@ -179,6 +184,8 @@ def _save_incident(det, screenshot_path: str = None) -> dict | None:
             stream_id=stream.stream_id,
             type=alert_type,
             confidence=confidence,
+            scene_violence_score=scene_violence_score,
+            person_count=person_count,
             timestamp=datetime.utcnow(),
             location=stream.location,
             screenshot_path=screenshot_path,
@@ -228,6 +235,8 @@ def _write_detection_log(stream_id: str, result, processing_ms: float):
             stream_id=stream_id,
             timestamp=datetime.utcnow(),
             person_count=len(detections_data),
+            has_violence=result.has_violence,
+            scene_violence_score=round(result.scene_violence_prob, 4) if result.scene_violence_prob else None,
             detections=detections_data,
             processing_time_ms=round(processing_ms, 2),
         ))
@@ -306,7 +315,12 @@ def generate_frames():
                 for det in result.detections:
                     if det.is_violent:
                         stats['alerts_triggered'] += 1
-                        incident_data = _save_incident(det, screenshot_path)
+                        incident_data = _save_incident(
+                            det,
+                            screenshot_path=screenshot_path,
+                            scene_violence_score=round(result.scene_violence_prob, 4),
+                            person_count=len(result.detections),
+                        )
                         if incident_data:
                             socketio.emit('violence_alert', incident_data)
 
