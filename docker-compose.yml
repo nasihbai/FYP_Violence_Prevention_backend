@@ -2,21 +2,25 @@ version: '3.9'
 
 # ─── Violence Prevention System — Full Stack ──────────────────────────────────
 #
-# Three services:
-#   db       — PostgreSQL 16 (always runs via Docker)
+# Services:
+#   db       — PostgreSQL 16 (port 5432)
 #   backend  — Flask API + SocketIO (port 5000)
-#   frontend — Vue 3 built into nginx (port 3001)
+#   frontend — Vue 3 / nginx (port 3001)
+#   adminer  — Lightweight DB browser (port 8080)   ← quick table/row inspection
+#   pgadmin  — Full DB GUI with ERD diagram tool (port 5050)
 #
-# Quick start:
+# Quick start (everything):
 #   docker compose up --build
 #
-# Database only (run backend + frontend natively, e.g. for GPU detection):
-#   docker compose up db
+# Database + tools only (run backend+frontend natively for GPU detection):
+#   docker compose up db adminer pgadmin
 #
-# Credentials (change JWT_SECRET_KEY before any shared/demo deployment):
-#   DB user:     violence_user
-#   DB password: violence_pass
-#   DB name:     violence_db
+# Credentials:
+#   DB user:          violence_user
+#   DB password:      violence_pass
+#   DB name:          violence_db
+#   pgAdmin login:    admin@fyp.local / admin123
+#   pgAdmin server:   host=db  port=5432 (add manually on first login)
 
 services:
 
@@ -86,6 +90,46 @@ services:
       timeout: 5s
       retries: 3
 
+  # ── Adminer — quick data browser ─────────────────────────────────────────
+  # Open http://localhost:8080
+  #   System:   PostgreSQL
+  #   Server:   db
+  #   Username: violence_user
+  #   Password: violence_pass
+  #   Database: violence_db
+  adminer:
+    image: adminer:latest
+    restart: unless-stopped
+    depends_on:
+      - db
+    ports:
+      - "8080:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: db
+      ADMINER_DESIGN: pepa-linha   # clean theme
+
+  # ── pgAdmin — full GUI with ERD diagram builder ───────────────────────────
+  # Open http://localhost:5050
+  #   Login:    admin@fyp.local / admin123
+  #   To connect: Object > Register > Server
+  #     Name: violence_db  Host: db  Port: 5432
+  #     User: violence_user  Password: violence_pass
+  # ERD: right-click the database > ERD For Database
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    restart: unless-stopped
+    depends_on:
+      - db
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@fyp.local
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
 volumes:
   postgres_data:
+    driver: local
+  pgadmin_data:
     driver: local
