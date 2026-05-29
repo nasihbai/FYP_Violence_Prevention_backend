@@ -241,7 +241,21 @@ def _write_detection_log(stream_id: str, result, processing_ms: float):
 
 # ==================== VIDEO / DETECTION ====================
 
-LOG_INTERVAL = 30   # write a DetectionLog row every N frames
+LOG_INTERVAL = 30       # write a DetectionLog row every N frames
+SCREENSHOT_COOLDOWN = 10  # seconds between saved screenshots per incident burst
+
+
+def _save_screenshot(annotated_frame) -> str | None:
+    """Save the annotated frame to disk. Returns the file path or None on error."""
+    try:
+        screenshot_dir = Path(__file__).parent.parent / 'alerts' / 'screenshots'
+        screenshot_dir.mkdir(parents=True, exist_ok=True)
+        fname = screenshot_dir / f"incident_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+        cv2.imwrite(str(fname), annotated_frame)
+        return str(fname)
+    except Exception as exc:
+        logger.warning(f"Screenshot save failed: {exc}")
+        return None
 
 
 def generate_frames():
@@ -260,6 +274,8 @@ def generate_frames():
     stream_id = f"CAM_{video_source}" if isinstance(video_source, int) \
         else Path(str(video_source)).stem.upper()
 
+    last_screenshot_time = 0.0
+
     try:
         while is_running:
             t0 = time.time()
@@ -273,20 +289,30 @@ def generate_frames():
             stats['current_fps'] = result.fps
             processing_ms = (time.time() - t0) * 1000
 
+            # Draw boxes FIRST so the saved screenshot includes them
+            annotated = detector.draw_results(frame, result)
+
             if result.has_violence:
                 stats['violence_detections'] += 1
+
+                # Save one screenshot per cooldown window so the review queue
+                # gets a representative frame without flooding disk
+                screenshot_path = None
+                if t0 - last_screenshot_time >= SCREENSHOT_COOLDOWN:
+                    screenshot_path = _save_screenshot(annotated)
+                    if screenshot_path:
+                        last_screenshot_time = t0
+
                 for det in result.detections:
                     if det.is_violent:
                         stats['alerts_triggered'] += 1
-                        incident_data = _save_incident(det)
+                        incident_data = _save_incident(det, screenshot_path)
                         if incident_data:
                             socketio.emit('violence_alert', incident_data)
 
             # Write detection log every LOG_INTERVAL frames
             if stats['total_frames'] % LOG_INTERVAL == 0:
                 _write_detection_log(stream_id, result, processing_ms)
-
-            annotated = detector.draw_results(frame, result)
 
             with frame_lock:
                 current_frame = annotated.copy()
