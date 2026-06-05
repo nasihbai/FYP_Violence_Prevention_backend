@@ -1,6 +1,0 @@
-{
-  "sequence_length": 15,
-  "num_features": 309,
-  "model_type": "hybrid_cnn_gru",
-  "timestamp": "2026-01-28T00:32:34.994934"
-}

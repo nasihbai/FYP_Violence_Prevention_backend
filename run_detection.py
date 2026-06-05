@@ -29,6 +29,10 @@ import argparse
 import logging
 from pathlib import Path
 
+# Load .env before any config imports read os.environ
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / ".env")
+
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -73,7 +77,9 @@ def run_detection(args):
         lstm_model_path=model_path,
         use_yolo=not args.no_yolo,
         violence_threshold=args.threshold,
-        warmup_frames=args.warmup
+        warmup_frames=args.warmup,
+        use_scene_classifier=not args.no_scene_classifier,
+        use_person_classifier=not args.no_person_classifier,
     )
 
     # Initialize alert manager
@@ -141,8 +147,16 @@ def run_web_dashboard(args):
     logger.info(f"Model: {model_path}")
     logger.info(f"Source: {args.source}")
 
-    initialize_detector(model_path, args.source, not args.no_yolo)
-    run_server(host=args.host, port=args.port, debug=args.debug)
+    # With --reload, Werkzeug's reloader runs the script in two processes:
+    # a file-watching supervisor and the actual worker. Only the worker
+    # (WERKZEUG_RUN_MAIN=true) must initialize the detector — otherwise the
+    # camera gets opened twice and the second open fails.
+    reload = getattr(args, 'reload', False)
+    is_worker = os.environ.get('WERKZEUG_RUN_MAIN') == 'true'
+    if not reload or is_worker:
+        initialize_detector(model_path, args.source, not args.no_yolo)
+
+    run_server(host=args.host, port=args.port, debug=args.debug, use_reloader=reload)
 
 
 def main():
@@ -180,6 +194,16 @@ Examples:
         '--no-yolo',
         action='store_true',
         help='Disable YOLO multi-person detection'
+    )
+    parser.add_argument(
+        '--no-scene-classifier',
+        action='store_true',
+        help='Disable VideoMAE scene-level violence classifier'
+    )
+    parser.add_argument(
+        '--no-person-classifier',
+        action='store_true',
+        help='Disable VideoMAE per-person crop classifier'
     )
     parser.add_argument(
         '--threshold', '-t',
@@ -228,6 +252,11 @@ Examples:
         '--debug',
         action='store_true',
         help='Enable debug mode'
+    )
+    parser.add_argument(
+        '--reload',
+        action='store_true',
+        help='Auto-restart the web server when Python files change (dev only)'
     )
 
     args = parser.parse_args()

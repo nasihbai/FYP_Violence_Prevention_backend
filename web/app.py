@@ -19,6 +19,10 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+# Load .env before any config import reads os.environ
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent.parent / ".env")
+
 from flask import Flask, render_template, Response, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO
@@ -30,7 +34,8 @@ from config import WebConfig, VideoConfig, AlertConfig
 from core.detection_engine import ThreadSafeDetector, FrameResult
 from database import init_db, User, Stream, Incident, Alert, DetectionLog
 from database.db import get_session
-from auth import auth_bp, require_manage_role, seed_demo_users
+from .auth import auth_bp, require_manage_role, seed_demo_users
+from .api import api_bp
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +48,37 @@ app.config['SECRET_KEY'] = WebConfig.SECRET_KEY
 app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', WebConfig.SECRET_KEY)
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = False  # No expiry for dev; set timedelta in prod
 
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+_cors_origins = WebConfig.CORS_ORIGINS
+_cors_value = "*" if _cors_origins.strip() == "*" else [o.strip() for o in _cors_origins.split(",") if o.strip()]
+CORS(app, resources={r"/*": {"origins": _cors_value}}, supports_credentials=True)
+socketio = SocketIO(app, cors_allowed_origins=_cors_value, async_mode='threading')
 jwt = JWTManager(app)
 
 app.register_blueprint(auth_bp)
+app.register_blueprint(api_bp)
+
+
+# ==================== ERROR HANDLERS ====================
+# Normalize all error responses to the shape the FE expects:
+#   { "errors": { "<field>": ["message", ...] } }
+# Use "_" as the field for non-validation / generic errors.
+
+@app.errorhandler(Exception)
+def _handle_uncaught(e):
+    code = getattr(e, "code", 500)
+    msg = getattr(e, "description", None) or str(e) or "Internal Server Error"
+    logger.exception("Unhandled error on %s %s", request.method, request.path)
+    return jsonify({"errors": {"_": [msg]}}), code
+
+
+@app.errorhandler(404)
+def _handle_404(e):
+    return jsonify({"errors": {"_": [getattr(e, "description", None) or "Not Found"]}}), 404
+
+
+@app.errorhandler(405)
+def _handle_405(e):
+    return jsonify({"errors": {"_": [getattr(e, "description", None) or "Method Not Allowed"]}}), 405
 
 # Initialise database (SQLite by default; set DATABASE_URL env var for PostgreSQL)
 init_db()
@@ -90,8 +121,10 @@ def initialize_detector(model_path: str = None, source=0, use_yolo: bool = True)
         model_path = next((str(p) for p in candidates if p.exists()), None)
 
     detector = ThreadSafeDetector(
-        lstm_model_path=model_path if Path(model_path).exists() else None,
+        lstm_model_path=model_path if model_path and Path(model_path).exists() else None,
         use_yolo=use_yolo,
+        use_scene_classifier=True,
+        use_person_classifier=False,
     )
     detector.start()
     logger.info(f"Detector initialised — source: {source}")
@@ -114,7 +147,12 @@ def _get_or_create_stream(session, source) -> Stream:
     return stream
 
 
-def _save_incident(det, screenshot_path: str = None) -> dict | None:
+def _save_incident(
+    det,
+    screenshot_path: str = None,
+    scene_violence_score: float = None,
+    person_count: int = None,
+) -> dict | None:
     """
     Persist a violence detection event.
     Creates: Stream (if needed) → Incident → Alert.
@@ -146,6 +184,8 @@ def _save_incident(det, screenshot_path: str = None) -> dict | None:
             stream_id=stream.stream_id,
             type=alert_type,
             confidence=confidence,
+            scene_violence_score=scene_violence_score,
+            person_count=person_count,
             timestamp=datetime.utcnow(),
             location=stream.location,
             screenshot_path=screenshot_path,
@@ -164,15 +204,11 @@ def _save_incident(det, screenshot_path: str = None) -> dict | None:
         session.add(alert)
         session.commit()
 
-        # Return shape expected by Vue monitoring store (FlaskViolenceAlert)
-        return {
-            'id':        alert.id,
-            'timestamp': alert.timestamp.isoformat(),
-            'person_id': int(det.person_id) if det.person_id is not None else None,
-            'confidence': confidence,
-            'severity':  severity,
-            'camera_id': stream.stream_id,
-        }
+        # Return the full Alert shape — identical to POST /api/test/fire-alert
+        # and to what the FE's Alert type + alerts store expect (incident_id,
+        # type, acknowledged, dismissed, ...). Built before the session closes
+        # so the alert.incident relationship can still lazy-load.
+        return alert.to_dict()
     except Exception as exc:
         session.rollback()
         logger.error(f"Failed to save incident: {exc}")
@@ -199,6 +235,8 @@ def _write_detection_log(stream_id: str, result, processing_ms: float):
             stream_id=stream_id,
             timestamp=datetime.utcnow(),
             person_count=len(detections_data),
+            has_violence=result.has_violence,
+            scene_violence_score=round(result.scene_violence_prob, 4) if result.scene_violence_prob else None,
             detections=detections_data,
             processing_time_ms=round(processing_ms, 2),
         ))
@@ -212,7 +250,21 @@ def _write_detection_log(stream_id: str, result, processing_ms: float):
 
 # ==================== VIDEO / DETECTION ====================
 
-LOG_INTERVAL = 30   # write a DetectionLog row every N frames
+LOG_INTERVAL = 30       # write a DetectionLog row every N frames
+SCREENSHOT_COOLDOWN = 10  # seconds between saved screenshots per incident burst
+
+
+def _save_screenshot(annotated_frame) -> str | None:
+    """Save the annotated frame to disk. Returns the file path or None on error."""
+    try:
+        screenshot_dir = Path(__file__).parent.parent / 'alerts' / 'screenshots'
+        screenshot_dir.mkdir(parents=True, exist_ok=True)
+        fname = screenshot_dir / f"incident_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+        cv2.imwrite(str(fname), annotated_frame)
+        return str(fname)
+    except Exception as exc:
+        logger.warning(f"Screenshot save failed: {exc}")
+        return None
 
 
 def generate_frames():
@@ -231,6 +283,8 @@ def generate_frames():
     stream_id = f"CAM_{video_source}" if isinstance(video_source, int) \
         else Path(str(video_source)).stem.upper()
 
+    last_screenshot_time = 0.0
+
     try:
         while is_running:
             t0 = time.time()
@@ -244,20 +298,35 @@ def generate_frames():
             stats['current_fps'] = result.fps
             processing_ms = (time.time() - t0) * 1000
 
+            # Draw boxes FIRST so the saved screenshot includes them
+            annotated = detector.draw_results(frame, result)
+
             if result.has_violence:
                 stats['violence_detections'] += 1
+
+                # Save one screenshot per cooldown window so the review queue
+                # gets a representative frame without flooding disk
+                screenshot_path = None
+                if t0 - last_screenshot_time >= SCREENSHOT_COOLDOWN:
+                    screenshot_path = _save_screenshot(annotated)
+                    if screenshot_path:
+                        last_screenshot_time = t0
+
                 for det in result.detections:
                     if det.is_violent:
                         stats['alerts_triggered'] += 1
-                        incident_data = _save_incident(det)
+                        incident_data = _save_incident(
+                            det,
+                            screenshot_path=screenshot_path,
+                            scene_violence_score=round(result.scene_violence_prob, 4),
+                            person_count=len(result.detections),
+                        )
                         if incident_data:
                             socketio.emit('violence_alert', incident_data)
 
             # Write detection log every LOG_INTERVAL frames
             if stats['total_frames'] % LOG_INTERVAL == 0:
                 _write_detection_log(stream_id, result, processing_ms)
-
-            annotated = detector.draw_results(frame, result)
 
             with frame_lock:
                 current_frame = annotated.copy()
@@ -325,29 +394,6 @@ def get_stats():
         'uptime': uptime,
         'is_running': is_running,
     })
-
-
-@app.route('/api/alerts')
-def get_alerts():
-    """Return incident history — requires valid JWT."""
-    from flask_jwt_extended import verify_jwt_in_request
-    try:
-        verify_jwt_in_request()
-    except Exception:
-        return jsonify({'message': 'Unauthorized'}), 401
-
-    limit = request.args.get('limit', 50, type=int)
-    session = get_session()
-    try:
-        alerts = (
-            session.query(Alert)
-            .order_by(Alert.timestamp.desc())
-            .limit(limit)
-            .all()
-        )
-        return jsonify([a.to_dict() for a in alerts])
-    finally:
-        session.close()
 
 
 @app.route('/api/config', methods=['GET', 'POST'])
@@ -433,8 +479,16 @@ def create_app(model_path: str = None, source=0, use_yolo: bool = True):
     return app
 
 
-def run_server(host: str = '0.0.0.0', port: int = 5000, debug: bool = False):
-    socketio.run(app, host=host, port=port, debug=debug)
+def run_server(host: str = '0.0.0.0', port: int = 5000, debug: bool = False,
+               use_reloader: bool = False):
+    socketio.run(
+        app,
+        host=host,
+        port=port,
+        debug=debug,
+        use_reloader=use_reloader,
+        allow_unsafe_werkzeug=True,  # dev server; fine for an FYP demo
+    )
 
 
 if __name__ == '__main__':

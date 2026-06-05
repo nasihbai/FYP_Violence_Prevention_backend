@@ -12,6 +12,7 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import (
     create_access_token,
     jwt_required,
+    get_jwt,
     get_jwt_identity,
     verify_jwt_in_request,
 )
@@ -90,13 +91,17 @@ def login():
         user.last_login = datetime.utcnow()
         session.commit()
 
-        identity = {
-            'id':        user.id,
-            'email':     user.email,
-            'user_type': user.role,      # matches jBoilerplate User.user_type
-            'fullname':  user.username,
-        }
-        access_token = create_access_token(identity=identity)
+        # flask-jwt-extended 4.6+ requires the identity (the JWT "sub"
+        # claim) to be a string. The user id is the identity; everything
+        # else rides along as additional claims, read back via get_jwt().
+        access_token = create_access_token(
+            identity=str(user.id),
+            additional_claims={
+                'email':     user.email,
+                'user_type': user.role,   # matches jBoilerplate User.user_type
+                'fullname':  user.username,
+            },
+        )
 
         return jsonify({
             'access_token': access_token,
@@ -116,16 +121,28 @@ def login():
 @jwt_required()
 def me():
     """Return current user info from the JWT."""
-    identity = get_jwt_identity()
+    user_id = get_jwt_identity()      # string user id (the "sub" claim)
+    claims = get_jwt()                # additional claims set at login
     return jsonify({
-        'id':         str(identity['id']),
-        'fullname':   identity['fullname'],
-        'email':      identity['email'],
-        'user_type':  identity['user_type'],
+        'id':         str(user_id),
+        'fullname':   claims.get('fullname', ''),
+        'email':      claims.get('email', ''),
+        'user_type':  claims.get('user_type', ''),
         'avatar':     '',
         'created_at': '',
         'updated_at': '',
     })
+
+
+@auth_bp.route('/logout', methods=['POST'])
+def logout():
+    """
+    Stateless logout. JWT is held client-side and dropped by the FE;
+    nothing to invalidate server-side until refresh-token rotation lands
+    (Phase 6 / hardening). Returning a body so the FE can confirm the
+    round-trip succeeded.
+    """
+    return jsonify({'ok': True})
 
 
 # ---------------------------------------------------------------------------
@@ -135,13 +152,15 @@ def me():
 def require_manage_role():
     """
     Verify JWT and check for admin/superadmin role.
-    Returns (identity, None) on success, (None, error_response) on failure.
+    Returns (claims, None) on success, (None, error_response) on failure.
+    `claims` carries user_type / email / fullname; the user id is in
+    get_jwt_identity().
     """
     try:
         verify_jwt_in_request()
-        identity = get_jwt_identity()
-        if identity.get('user_type') not in MANAGE_ROLES:
+        claims = get_jwt()
+        if claims.get('user_type') not in MANAGE_ROLES:
             return None, (jsonify({'message': 'Insufficient role'}), 403)
-        return identity, None
+        return claims, None
     except Exception as exc:
         return None, (jsonify({'message': f'Unauthorized: {exc}'}), 401)
