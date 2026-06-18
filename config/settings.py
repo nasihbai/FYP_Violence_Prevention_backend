@@ -225,6 +225,51 @@ class LogConfig:
     BACKUP_COUNT = 5
 
 # =============================================================================
+# INTERACTION-AWARE DETECTION CONFIGURATION  (Milestone 1-3)
+# =============================================================================
+class InteractionConfig:
+    # ── Model paths ──────────────────────────────────────────────────────────
+    POSE_MODEL             = "yolov8n-pose.pt"          # auto-downloads from ultralytics
+    INTERACTION_MODEL_PATH = MODELS_DIR / "violence_interaction_lstm.h5"
+
+    # ── Sequence settings (MUST be identical in training and inference) ──────
+    SEQUENCE_LENGTH = 20
+    FRAME_STRIDE    = 2     # sample every Nth frame during extraction
+
+    # ── Feature dimensions ────────────────────────────────────────────────────
+    #   Isolated block (8) + scene scalars (2) = 10  → Ablation B
+    #   Full (10) + interaction block (9)      = 19  → Ablation C (proposed)
+    FEATURE_DIM_ISOLATED = 10
+    FEATURE_DIM_FULL     = 19
+
+    # ── Heuristic thresholds (ported from reference implementation) ──────────
+    HEURISTIC_HISTORY     = 25     # keypoint frames kept per tracked person
+    FIGHT_THRESHOLD       = 0.35   # combined score needed to flag a fight
+    SPEED_FIGHT_THRESH    = 8.0    # avg wrist/elbow speed (px/frame) to score
+    PROXIMITY_THRESH      = 250    # px — max centre-to-centre dist to score
+    ANGLE_VARIANCE_THRESH = 400    # body-angle variance threshold
+    OVERLAP_IOU_THRESH    = 0.05   # bbox IoU threshold
+    WRIST_TO_BODY_THRESH  = 80     # px — wrist near opponent torso
+    SMOOTH_WINDOW         = 8      # majority-vote window size
+
+    # ── Dataset path ─────────────────────────────────────────────────────────
+    # Supports two layouts (auto-detected at runtime):
+    #   A) RLVS flat layout:       Violence/*.mp4  +  NonViolence/*.mp4
+    #   B) Existing train/val layout:  train/{Fight,NonFight,...}/*.avi
+    RLVS_DATASET_PATH = Path(
+        os.environ.get(
+            "VIOLENCE_DATASET",
+            str(BASE_DIR / "violenceDetectionDataset" / "Complete Dataset"),
+        )
+    )
+    RLVS_CACHE_DIR   = BASE_DIR / "dataset_cache" / "rlvs"
+    RLVS_RESULTS_DIR = BASE_DIR / "training_results" / "interaction"
+    RLVS_TRAIN_RATIO = 0.70
+    RLVS_VAL_RATIO   = 0.15
+    RLVS_TEST_RATIO  = 0.15
+    RLVS_SEED        = 42
+
+# =============================================================================
 # VISUALIZATION CONFIGURATION
 # =============================================================================
 class VisualizationConfig:

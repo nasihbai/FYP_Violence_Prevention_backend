@@ -51,7 +51,7 @@ def run_detection(args):
     from core.detection_engine import ThreadSafeDetector, VideoProcessor
     from alerts.alert_system import AlertManager
 
-    # Determine model path
+    # Determine legacy LSTM model path (optional — only used when interaction mode is off)
     model_path = args.model
     if model_path is None:
         root = Path(__file__).parent
@@ -65,10 +65,23 @@ def run_detection(args):
         if found:
             model_path = str(found)
         else:
-            logger.warning("No model found. Running without LSTM classification.")
+            logger.warning("No legacy LSTM model found. Interaction pipeline will use heuristic.")
             model_path = None
 
-    logger.info(f"Model path: {model_path}")
+    # Interaction model (M3) — preferred over legacy LSTM
+    root = Path(__file__).parent
+    interaction_candidates = [
+        root / 'models' / 'violence_interaction_lstm.h5',   # trained interaction model (M3)
+    ]
+    interaction_model_path = next(
+        (str(p) for p in interaction_candidates if p.exists()), None
+    )
+    if interaction_model_path:
+        logger.info("Interaction model found: %s", interaction_model_path)
+    else:
+        logger.info("Interaction model not found — using heuristic classifier (Milestone 1 mode)")
+
+    logger.info(f"Legacy model path: {model_path}")
     logger.info(f"Video source: {args.source}")
     logger.info(f"YOLO enabled: {not args.no_yolo}")
 
@@ -80,6 +93,8 @@ def run_detection(args):
         warmup_frames=args.warmup,
         use_scene_classifier=not args.no_scene_classifier,
         use_person_classifier=not args.no_person_classifier,
+        use_pose_interaction=True,
+        interaction_model_path=interaction_model_path,
     )
 
     # Initialize alert manager
@@ -131,12 +146,12 @@ def run_web_dashboard(args):
     """Run detection with web dashboard."""
     from web.app import initialize_detector, run_server
 
-    # Determine model path
+    # Determine legacy LSTM model path
     model_path = args.model
     if model_path is None:
         root = Path(__file__).parent
         candidates = [
-            root / 'models' / 'violence_lstm_dataset.h5',   # 309-feature, proven pipeline
+            root / 'models' / 'violence_lstm_dataset.h5',
             root / 'lstm-model.h5',
             root / 'models' / 'violence_lstm_rwf2000.h5',
             root / 'models' / 'violence_lstm_enhanced.h5',

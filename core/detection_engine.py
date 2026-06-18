@@ -18,6 +18,22 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# COCO-17 skeleton pairs for drawing pose overlays
+_COCO_SKELETON = [
+    (0, 5), (0, 6),                          # nose → shoulders
+    (5, 6),                                   # shoulder bridge
+    (5, 7), (7, 9),                           # left arm
+    (6, 8), (8, 10),                          # right arm
+    (5, 11), (6, 12),                         # torso sides
+    (11, 12),                                 # hip bridge
+    (11, 13), (13, 15),                       # left leg
+    (12, 14), (14, 16),                       # right leg
+]
+_SKELETON_COLORS = [
+    (0, 255, 128), (0, 200, 255), (255, 200, 0),
+    (255, 80, 180), (180, 80, 255), (255, 130, 0),
+]
+
 
 @dataclass
 class DetectionResult:
@@ -63,18 +79,28 @@ class ThreadSafeDetector:
         warmup_frames: int = 30,
         use_scene_classifier: bool = True,
         use_person_classifier: bool = False,
+        use_pose_interaction: bool = True,
+        interaction_model_path: Optional[str] = None,
     ):
         """
         Initialize detector.
 
         Args:
-            lstm_model_path: Path to LSTM model
-            yolo_model: YOLO model name/path
-            use_yolo: Whether to use YOLO for multi-person detection
-            sequence_length: Number of frames for LSTM sequence
-            violence_threshold: Threshold for violence detection
-            smoothing_window: Window size for prediction smoothing
-            warmup_frames: Frames to skip at start
+            lstm_model_path:        Path to legacy per-person LSTM model.
+            yolo_model:             YOLO detection model name/path.
+            use_yolo:               Use YOLO for multi-person detection.
+            sequence_length:        Frames for legacy LSTM sequence.
+            violence_threshold:     Confidence threshold for violence.
+            smoothing_window:       Prediction smoothing window size.
+            warmup_frames:          Frames to skip at startup.
+            use_scene_classifier:   Enable VideoMAE scene classifier.
+            use_person_classifier:  Enable per-person crop classifier.
+            use_pose_interaction:   Enable the new YOLOv8-pose + interaction
+                                    pipeline (M1/M3).  When True this becomes
+                                    the primary violence signal.
+            interaction_model_path: Path to trained interaction LSTM (.h5).
+                                    When None the heuristic classifier is used
+                                    (Milestone 1).
         """
         self.sequence_length = sequence_length
         self.violence_threshold = violence_threshold
@@ -102,21 +128,76 @@ class ThreadSafeDetector:
         self.use_yolo = use_yolo
         self._scene_violence_prob: float = 0.0
 
+        # Interaction-aware pipeline (M1 / M3)
+        self.use_pose_interaction   = use_pose_interaction
+        self.pose_estimator         = None   # YOLOPoseEstimator
+        self.heuristic_classifier   = None   # HeuristicFightClassifier  (M1)
+        self.interaction_lstm       = None   # Keras model               (M3)
+        self._feature_buffer: deque = deque(maxlen=sequence_length)
+        self._prev_persons          = None   # previous frame PersonPose list
+        self._last_persons          = []     # current frame PersonPose list (for draw)
+        self._interaction_prob: float = 0.0
+        self._per_fight:  Dict[int, bool] = {}
+        self._per_fall:   Dict[int, bool] = {}
+
         # FPS calculation
         self._fps_history = deque(maxlen=30)
         self._last_frame_time = time.time()
 
         # Initialize components
-        self._initialize_components(lstm_model_path, yolo_model, use_scene_classifier, use_person_classifier)
+        self._initialize_components(
+            lstm_model_path, yolo_model,
+            use_scene_classifier, use_person_classifier,
+            use_pose_interaction, interaction_model_path,
+        )
 
     def _initialize_components(
         self, lstm_model_path: Optional[str], yolo_model: str,
-        use_scene_classifier: bool, use_person_classifier: bool
+        use_scene_classifier: bool, use_person_classifier: bool,
+        use_pose_interaction: bool = True,
+        interaction_model_path: Optional[str] = None,
     ):
         """Initialize detection components."""
+        # ── Interaction-aware pipeline (M1 / M3) ──────────────────────────
+        if use_pose_interaction:
+            try:
+                from .pose_estimator import YOLOPoseEstimator
+                from config.settings import InteractionConfig as _IC
+                self.pose_estimator = YOLOPoseEstimator(
+                    model_path=_IC.POSE_MODEL, conf=0.35
+                )
+                logger.info("YOLOPoseEstimator ready (%s)", _IC.POSE_MODEL)
+            except Exception as exc:
+                logger.warning("YOLOPoseEstimator init failed (%s); falling back to legacy pipeline", exc)
+                self.use_pose_interaction = False
+
+        if use_pose_interaction and self.pose_estimator is not None:
+            # Try trained interaction LSTM (M3); fall back to heuristic (M1) if absent.
+            loaded = False
+            model_to_try = interaction_model_path
+            if model_to_try is None:
+                try:
+                    from config.settings import InteractionConfig as _IC
+                    model_to_try = str(_IC.INTERACTION_MODEL_PATH)
+                except Exception:
+                    pass
+            if model_to_try and Path(model_to_try).exists():
+                try:
+                    import tensorflow as tf
+                    self.interaction_lstm = tf.keras.models.load_model(model_to_try)
+                    logger.info("Interaction LSTM loaded from %s", model_to_try)
+                    loaded = True
+                except Exception as exc:
+                    logger.warning("Could not load interaction LSTM (%s); using heuristic", exc)
+
+            if not loaded:
+                from .heuristic_classifier import HeuristicFightClassifier
+                self.heuristic_classifier = HeuristicFightClassifier()
+                logger.info("Using heuristic fight classifier (Milestone 1 mode)")
+
         from .pose_extractor import PoseExtractor, LandmarkBuffer
 
-        # Initialize pose extractor
+        # Initialize pose extractor (legacy pipeline)
         self.pose_extractor = PoseExtractor()
         self.landmark_buffer = LandmarkBuffer(sequence_length=self.sequence_length)
 
@@ -286,6 +367,10 @@ class ThreadSafeDetector:
                 timestamp=current_time
             )
 
+        # ── Interaction-aware pipeline (M1 heuristic / M3 LSTM) ──────────
+        if self.use_pose_interaction and self.pose_estimator is not None:
+            return self._process_interaction(frame, fps, current_time)
+
         # Multi-person detection with YOLO
         if self.use_yolo and self.yolo_detector is not None:
             need_crops = self.person_classifier is not None
@@ -408,6 +493,115 @@ class ThreadSafeDetector:
             scene_violence_prob=self._scene_violence_prob,
         )
 
+    def _process_interaction(
+        self,
+        frame:        np.ndarray,
+        fps:          float,
+        current_time: float,
+    ) -> FrameResult:
+        """
+        Interaction-aware processing path (Milestone 1 / 3).
+
+        Uses YOLOv8-pose for full-frame multi-person pose estimation, then
+        routes through either the heuristic classifier (M1) or the trained
+        interaction LSTM (M3) to produce a scene-level violence decision.
+        """
+        from .interaction_features import frame_feature_vector, FEATURE_DIM_FULL
+        from config.settings import InteractionConfig as _IC
+
+        h, w = frame.shape[:2]
+
+        # ── Pose estimation ────────────────────────────────────────────────
+        persons = self.pose_estimator.estimate(frame)
+
+        with self._lock:
+            self._last_persons = persons
+
+        # Build DetectionResult list from PersonPose objects
+        detections: List[DetectionResult] = []
+        for p in persons:
+            detections.append(DetectionResult(
+                person_id  = p.track_id,
+                bbox       = p.bbox,
+                is_violent = False,
+                confidence = 0.0,
+                class_name = 'neutral',
+                timestamp  = current_time,
+            ))
+
+        # Minimum-person gate
+        try:
+            from config.settings import VideoMAEConfig as _VMC
+            min_persons = _VMC.MIN_PERSONS_FOR_ALERT
+        except Exception:
+            min_persons = 2
+        enough = len(persons) >= min_persons
+
+        # ── Heuristic (M1) ─────────────────────────────────────────────────
+        has_violence = False
+        if self.heuristic_classifier is not None:
+            any_fight, any_fall, scene_score, per_fight, per_fall = \
+                self.heuristic_classifier.classify(persons)
+
+            with self._lock:
+                self._interaction_prob = scene_score
+                self._per_fight        = per_fight
+                self._per_fall         = per_fall
+
+            for det in detections:
+                tid = det.person_id
+                if per_fight.get(tid) or per_fall.get(tid):
+                    det.is_violent = True
+                    det.confidence = scene_score
+                    det.class_name = 'fight' if per_fight.get(tid) else 'fallen'
+
+            has_violence = enough and (any_fight or any_fall)
+
+        # ── Trained interaction LSTM (M3) ──────────────────────────────────
+        elif self.interaction_lstm is not None:
+            kps_list   = [p.keypoints for p in persons]
+            bbox_list  = [p.bbox for p in persons]
+            prev_kps   = [p.keypoints for p in self._prev_persons] \
+                         if self._prev_persons else None
+
+            feat = frame_feature_vector(
+                kps_list, bbox_list,
+                prev_kps=prev_kps,
+                frame_h=h, frame_w=w,
+                include_interaction=True,
+            )
+            self._feature_buffer.append(feat)
+
+            if len(self._feature_buffer) == _IC.SEQUENCE_LENGTH:
+                seq   = np.stack(list(self._feature_buffer))[np.newaxis]  # (1, T, F)
+                probs = self.interaction_lstm.predict(seq, verbose=0)[0]
+                prob  = float(probs[1])  # index 1 = violent class
+
+                with self._lock:
+                    self._interaction_prob = prob
+
+                if enough and prob >= self.violence_threshold:
+                    has_violence = True
+                    for det in detections:
+                        det.is_violent = True
+                        det.confidence = prob
+                        det.class_name = 'violent'
+
+            with self._lock:
+                self._per_fight = {p.track_id: has_violence for p in persons}
+                self._per_fall  = {}
+
+        self._prev_persons = persons
+
+        return FrameResult(
+            frame              = frame,
+            detections         = detections,
+            fps                = fps,
+            timestamp          = current_time,
+            has_violence       = has_violence,
+            scene_violence_prob= self._interaction_prob,
+        )
+
     def draw_results(
         self,
         frame: np.ndarray,
@@ -428,6 +622,67 @@ class ThreadSafeDetector:
             Annotated frame
         """
         annotated = frame.copy()
+
+        # ── Interaction-mode skeleton overlay ─────────────────────────────
+        if self.use_pose_interaction:
+            with self._lock:
+                persons_snap = list(self._last_persons)
+                per_fight    = dict(self._per_fight)
+                per_fall     = dict(self._per_fall)
+
+            for p in persons_snap:
+                color    = _SKELETON_COLORS[p.track_id % len(_SKELETON_COLORS)]
+                is_fight = per_fight.get(p.track_id, False)
+                is_fall  = per_fall.get(p.track_id, False)
+                kps      = p.keypoints   # (17, 3)
+
+                # Skeleton lines
+                for (a, b) in _COCO_SKELETON:
+                    if kps[a, 2] >= 0.30 and kps[b, 2] >= 0.30:
+                        cv2.line(annotated,
+                                 (int(kps[a, 0]), int(kps[a, 1])),
+                                 (int(kps[b, 0]), int(kps[b, 1])),
+                                 color, 2, cv2.LINE_AA)
+                # Keypoint dots
+                for i in range(17):
+                    if kps[i, 2] >= 0.30:
+                        cx, cy = int(kps[i, 0]), int(kps[i, 1])
+                        cv2.circle(annotated, (cx, cy), 4, color,        -1, cv2.LINE_AA)
+                        cv2.circle(annotated, (cx, cy), 4, (255,255,255), 1, cv2.LINE_AA)
+
+                # Bbox + label
+                x1, y1, x2, y2 = p.bbox
+                if is_fight:
+                    box_color = (0, 0, 220)
+                    label     = f"ID:{p.track_id} FIGHT"
+                elif is_fall:
+                    box_color = (0, 100, 220)
+                    label     = f"ID:{p.track_id} FALLEN"
+                else:
+                    box_color = (30, 190, 30)
+                    label     = f"ID:{p.track_id}"
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2, cv2.LINE_AA)
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.5, 1)
+                cv2.rectangle(annotated, (x1, y1-th-6), (x1+tw+4, y1), box_color, -1)
+                cv2.putText(annotated, label, (x1+2, y1-4),
+                            cv2.FONT_HERSHEY_DUPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
+
+            # Threat bar
+            prob = self._interaction_prob
+            if result.has_violence:
+                cv2.rectangle(annotated, (0, 0), (annotated.shape[1], 44), (0, 0, 180), -1)
+                cv2.putText(annotated, "!!!  VIOLENCE DETECTED",
+                            (14, 30), cv2.FONT_HERSHEY_DUPLEX, 0.9, (255,255,255), 1, cv2.LINE_AA)
+            bar_w = 220
+            bar_x = annotated.shape[1] - bar_w - 10
+            bar_y = annotated.shape[0] - 26
+            cv2.rectangle(annotated, (bar_x, bar_y), (bar_x+bar_w, bar_y+16), (60,60,60), -1)
+            fill = int(bar_w * prob)
+            fill_col = (0,0,210) if result.has_violence else (0,180,0)
+            cv2.rectangle(annotated, (bar_x, bar_y), (bar_x+fill, bar_y+16), fill_col, -1)
+            cv2.rectangle(annotated, (bar_x, bar_y), (bar_x+bar_w, bar_y+16), (200,200,200), 1)
+            cv2.putText(annotated, f"Threat {prob:.0%}", (bar_x+4, bar_y+12),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.40, (255,255,255), 1, cv2.LINE_AA)
 
         # Draw FPS
         if show_fps:
@@ -546,9 +801,17 @@ class ThreadSafeDetector:
             self._prediction_history.clear()
             self._pose_cache.clear()
             self.landmark_buffer.clear()
+            self._feature_buffer.clear()
+            self._prev_persons    = None
+            self._last_persons    = []
+            self._interaction_prob = 0.0
+            self._per_fight = {}
+            self._per_fall  = {}
 
             if self.lstm_classifier:
                 self.lstm_classifier.reset_history()
+            if self.heuristic_classifier:
+                self.heuristic_classifier.reset()
 
     def get_stats(self) -> Dict:
         """Get detector statistics."""
