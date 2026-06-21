@@ -237,10 +237,10 @@ class InteractionConfig:
     FRAME_STRIDE    = 2     # sample every Nth frame during extraction
 
     # ── Feature dimensions ────────────────────────────────────────────────────
-    #   Isolated block (8) + scene scalars (2) = 10  → Ablation B
-    #   Full (10) + interaction block (9)      = 19  → Ablation C (proposed)
-    FEATURE_DIM_ISOLATED = 10
-    FEATURE_DIM_FULL     = 19
+    #   Isolated block (10) + scene scalars (2) = 12  → Ablation B
+    #   Full (12) + interaction block (15)      = 27  → Ablation C (proposed)
+    FEATURE_DIM_ISOLATED = 12
+    FEATURE_DIM_FULL     = 27
 
     # ── Heuristic thresholds (ported from reference implementation) ──────────
     HEURISTIC_HISTORY     = 25     # keypoint frames kept per tracked person

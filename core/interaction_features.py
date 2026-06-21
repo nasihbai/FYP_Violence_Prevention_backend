@@ -7,22 +7,25 @@ math in any other file — train/inference skew is how the 132→309
 remap bug was born.
 
 Feature vector layout (per frame):
-  ┌─ Isolated block (8) ──────────────────────────────────────────┐
-  │  mean_arm_raise, max_arm_raise                                 │
-  │  mean_limb_speed, max_limb_speed                               │
-  │  mean_trunk_angle, max_trunk_angle  (abs, normalised to [-1,1])│
-  │  mean_bbox_aspect, max_bbox_aspect  (normalised, capped at 1)  │
+  ┌─ Isolated block (10) ─────────────────────────────────────────┐
+  │  mean/max  arm_raise         (wrist above shoulder level)      │
+  │  mean/max  limb_speed        (wrist+elbow speed, normalised)   │
+  │  mean/max  trunk_angle       (abs, normalised to [0,1])        │
+  │  mean/max  bbox_aspect       (normalised, capped at 1)         │
+  │  mean/max  elbow_angle       (shoulder→elbow→wrist angle [0,1])│
   ├─ Scene scalars (2) ────────────────────────────────────────────┤
   │  person_count_norm  (count / 10, capped at 1)                  │
   │  motion_energy      (same as mean_limb_speed — convenience)    │
-  ├─ Interaction block (9)  ← present only in FEATURE_DIM_FULL ───┤
-  │  min/max/mean  proximity    (0=far, 1=same point)              │
+  ├─ Interaction block (15) ──────────────────────────────────────┤
+  │  min/max/mean  proximity          (0=far, 1=same point)        │
   │  min/max/mean  bbox_iou                                        │
-  │  min/max/mean  wrist_near_opponent                             │
+  │  min/max/mean  wrist_near_torso   (grabbing/striking)          │
+  │  min/max/mean  head_proximity     (nose-to-nose distance)      │
+  │  min/max/mean  wrist_toward_opp   (wrist velocity → opponent)  │
   └───────────────────────────────────────────────────────────────┘
 
-  FEATURE_DIM_ISOLATED = 10   (Ablation B)
-  FEATURE_DIM_FULL     = 19   (Ablation C — proposed model)
+  FEATURE_DIM_ISOLATED = 12   (Ablation B)
+  FEATURE_DIM_FULL     = 27   (Ablation C — proposed model)
 """
 
 import numpy as np
@@ -39,17 +42,16 @@ KP_L_HIP,      KP_R_HIP             = 11, 12
 KP_L_KNEE,     KP_R_KNEE            = 13, 14
 KP_L_ANKLE,    KP_R_ANKLE           = 15, 16
 
-# Keypoints used for speed (fast-moving limbs are most discriminative)
 SPEED_KP_INDICES = [KP_L_WRIST, KP_R_WRIST, KP_L_ELBOW, KP_R_ELBOW]
 
-CONF_THRESH = 0.30   # keypoint confidence below this → treat as missing
+CONF_THRESH = 0.30
 
 # ── Feature layout constants ──────────────────────────────────────────────────
-FEATURE_DIM_ISOLATED = 10
-FEATURE_DIM_FULL     = 19
+FEATURE_DIM_ISOLATED = 12   # isolated (10) + scene (2)
+FEATURE_DIM_FULL     = 27   # isolated (10) + scene (2) + interaction (15)
 
 FEATURE_LAYOUT: dict = {
-    # Isolated block
+    # Isolated block (10 values)
     "mean_arm_raise":    0,
     "max_arm_raise":     1,
     "mean_limb_speed":   2,
@@ -58,26 +60,33 @@ FEATURE_LAYOUT: dict = {
     "max_trunk_angle":   5,
     "mean_bbox_aspect":  6,
     "max_bbox_aspect":   7,
-    # Scene scalars
-    "person_count_norm": 8,
-    "motion_energy":     9,
-    # Interaction block (only in FEATURE_DIM_FULL)
-    "min_proximity":    10,
-    "max_proximity":    11,
-    "mean_proximity":   12,
-    "min_iou":          13,
-    "max_iou":          14,
-    "mean_iou":         15,
-    "min_wrist_opp":    16,
-    "max_wrist_opp":    17,
-    "mean_wrist_opp":   18,
+    "mean_elbow_angle":  8,   # NEW — bent elbow = striking pose
+    "max_elbow_angle":   9,
+    # Scene scalars (2 values)
+    "person_count_norm": 10,
+    "motion_energy":     11,
+    # Interaction block (15 values)
+    "min_proximity":     12,
+    "max_proximity":     13,
+    "mean_proximity":    14,
+    "min_iou":           15,
+    "max_iou":           16,
+    "mean_iou":          17,
+    "min_wrist_opp":     18,
+    "max_wrist_opp":     19,
+    "mean_wrist_opp":    20,
+    "min_head_prox":     21,   # NEW — nose-to-nose closeness
+    "max_head_prox":     22,
+    "mean_head_prox":    23,
+    "min_wrist_toward":  24,   # NEW — wrist velocity toward opponent
+    "max_wrist_toward":  25,
+    "mean_wrist_toward": 26,
 }
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _kp(kps: np.ndarray, idx: int) -> Optional[Tuple[float, float]]:
-    """Return (x, y) if keypoint is visible, else None."""
     if kps[idx, 2] >= CONF_THRESH:
         return float(kps[idx, 0]), float(kps[idx, 1])
     return None
@@ -91,61 +100,44 @@ def _mid(kps: np.ndarray, a: int, b: int) -> Optional[Tuple[float, float]]:
     return None
 
 
-# ── Per-person feature helpers (public — used by heuristic_classifier too) ────
+# ── Per-person feature helpers ────────────────────────────────────────────────
 
 def arm_raise_score(kps: np.ndarray) -> float:
-    """
-    0–1: fraction of wrist-above-shoulder events.
-    1.0 = both wrists well above shoulder level (striking pose).
-    """
+    """0–1: wrist above shoulder level (striking pose)."""
     score, count = 0.0, 0
     for wrist_i, shoulder_i in [(KP_L_WRIST, KP_L_SHOULDER),
                                   (KP_R_WRIST, KP_R_SHOULDER)]:
         w = _kp(kps, wrist_i)
         s = _kp(kps, shoulder_i)
         if w and s:
-            # In image coords y increases downward, so wrist above shoulder ↔ w.y < s.y
-            diff  = s[1] - w[1]                      # positive when wrist is above shoulder
+            diff  = s[1] - w[1]   # positive when wrist above shoulder
             score += max(0.0, min(1.0, (diff + 20) / 80.0))
             count += 1
     return score / count if count else 0.0
 
 
 def trunk_angle_norm(kps: np.ndarray) -> float:
-    """
-    Trunk angle from vertical, normalised to [-1, 1].
-    0 = upright, ±1 = lying flat horizontally.
-    """
+    """Trunk angle from vertical, normalised to [-1, 1]. Abs taken downstream."""
     sh = _mid(kps, KP_L_SHOULDER, KP_R_SHOULDER)
     hp = _mid(kps, KP_L_HIP,      KP_R_HIP)
     if sh is None or hp is None:
         return 0.0
     dx = hp[0] - sh[0]
     dy = hp[1] - sh[1]
-    angle_deg = float(np.degrees(np.arctan2(dx, dy + 1e-6)))
-    return float(np.clip(angle_deg / 90.0, -1.0, 1.0))
+    return float(np.clip(np.degrees(np.arctan2(dx, dy + 1e-6)) / 90.0, -1.0, 1.0))
 
 
 def bbox_aspect_norm(bbox: Tuple[int, int, int, int]) -> float:
-    """
-    Bounding-box width/height ratio, capped and normalised to [0, 1].
-    1.0 = wide bbox (person lying flat), 0 = tall/normal.
-    A person standing normally has aspect < 1; lying down gives aspect > 1.
-    Cap at 3 to avoid outliers dominating.
-    """
-    x1, y1, x2, y2 = bbox
-    bw = max(1, x2 - x1)
-    bh = max(1, y2 - y1)
+    """Bbox width/height ratio, capped at 3 and normalised to [0, 1]."""
+    bw = max(1, bbox[2] - bbox[0])
+    bh = max(1, bbox[3] - bbox[1])
     return min(float(bw) / bh, 3.0) / 3.0
 
 
 def limb_speed_norm(kps_curr: np.ndarray,
                     kps_prev: Optional[np.ndarray],
                     frame_dim: float = 640.0) -> float:
-    """
-    Mean speed of fast-moving keypoints (wrists + elbows) between consecutive
-    frames, normalised by frame diagonal.  Returns 0 if no previous frame.
-    """
+    """Mean speed of wrists+elbows between frames, normalised."""
     if kps_prev is None:
         return 0.0
     speeds = []
@@ -157,6 +149,31 @@ def limb_speed_norm(kps_curr: np.ndarray,
     return float(np.mean(speeds)) if speeds else 0.0
 
 
+def elbow_angle_norm(kps: np.ndarray) -> float:
+    """
+    Mean of left and right elbow angles (shoulder→elbow→wrist), normalised [0, 1].
+    0 = fully bent (90° or less), 1 = fully straight arm (180°).
+    A cocked punch starts near 0, a delivered punch is near 1.
+    Both extremes differ from a relaxed hanging arm (~160°).
+    """
+    angles = []
+    for sh_i, el_i, wr_i in [(KP_L_SHOULDER, KP_L_ELBOW, KP_L_WRIST),
+                               (KP_R_SHOULDER, KP_R_ELBOW, KP_R_WRIST)]:
+        sh = _kp(kps, sh_i)
+        el = _kp(kps, el_i)
+        wr = _kp(kps, wr_i)
+        if sh and el and wr:
+            # Vector elbow→shoulder and elbow→wrist
+            v1 = np.array([sh[0] - el[0], sh[1] - el[1]])
+            v2 = np.array([wr[0] - el[0], wr[1] - el[1]])
+            n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+            if n1 > 1e-6 and n2 > 1e-6:
+                cos_a = float(np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0))
+                angle_deg = float(np.degrees(np.arccos(cos_a)))
+                angles.append(angle_deg / 180.0)   # normalise to [0, 1]
+    return float(np.mean(angles)) if angles else 0.5   # default = mid (unknown)
+
+
 def per_person_features(
     kps:       np.ndarray,
     bbox:      Tuple[int, int, int, int],
@@ -164,14 +181,15 @@ def per_person_features(
     frame_dim: float = 640.0,
 ) -> np.ndarray:
     """
-    4-element vector for a single person:
-      [arm_raise, limb_speed, trunk_angle_norm, bbox_aspect_norm]
+    5-element vector for a single person:
+      [arm_raise, limb_speed, trunk_angle_abs, bbox_aspect, elbow_angle]
     """
     return np.array([
         arm_raise_score(kps),
         limb_speed_norm(kps, kps_prev, frame_dim),
-        abs(trunk_angle_norm(kps)),    # use abs so mean/max are both non-negative
+        abs(trunk_angle_norm(kps)),
         bbox_aspect_norm(bbox),
+        elbow_angle_norm(kps),          # NEW
     ], dtype=np.float32)
 
 
@@ -197,10 +215,7 @@ def wrist_near_torso(
     kps_b:  np.ndarray,
     thresh: float = 80.0,
 ) -> float:
-    """
-    0–1: how close person A's wrists are to person B's torso keypoints.
-    Captures striking/grabbing interaction.
-    """
+    """0–1: person A's wrist near person B's torso (grabbing/striking)."""
     torso = [KP_L_SHOULDER, KP_R_SHOULDER, KP_L_HIP, KP_R_HIP]
     best  = 0.0
     for w in [KP_L_WRIST, KP_R_WRIST]:
@@ -217,44 +232,116 @@ def wrist_near_torso(
     return best
 
 
-def interaction_features(
-    persons_kps:  List[np.ndarray],
-    persons_bbox: List[Tuple],
+def _head_proximity(
+    kps_a:     np.ndarray,
+    kps_b:     np.ndarray,
+    frame_dim: float = 640.0,
+) -> float:
+    """
+    0–1: how close person A's nose is to person B's nose.
+    1 = same point, 0 = opposite ends of frame.
+    Falls back to shoulder midpoints when nose not visible.
+    """
+    def head_pt(kps):
+        n = _kp(kps, KP_NOSE)
+        if n:
+            return n
+        return _mid(kps, KP_L_SHOULDER, KP_R_SHOULDER)
+
+    pa = head_pt(kps_a)
+    pb = head_pt(kps_b)
+    if pa is None or pb is None:
+        return 0.0
+    dist = float(np.hypot(pa[0] - pb[0], pa[1] - pb[1]))
+    return max(0.0, 1.0 - dist / (frame_dim + 1e-6))
+
+
+def _wrist_velocity_toward_opponent(
+    kps_curr:     np.ndarray,
+    kps_prev:     Optional[np.ndarray],
+    bbox_opponent: Tuple,
     frame_dim:    float = 640.0,
-    wrist_thresh: float = 80.0,
+) -> float:
+    """
+    0–1+: component of wrist velocity pointing toward the opponent's centre.
+    Positive = wrist moving toward opponent (aggressive intent).
+    Returns 0 when no previous frame is available.
+    """
+    if kps_prev is None:
+        return 0.0
+    center = _bbox_center(bbox_opponent)
+    best   = 0.0
+    for w in [KP_L_WRIST, KP_R_WRIST]:
+        c = _kp(kps_curr, w)
+        p = _kp(kps_prev, w)
+        if c is None or p is None:
+            continue
+        # Wrist displacement vector
+        vx = c[0] - p[0]
+        vy = c[1] - p[1]
+        # Unit vector from wrist to opponent centre
+        dx = center[0] - c[0]
+        dy = center[1] - c[1]
+        dist = float(np.hypot(dx, dy)) + 1e-6
+        dx /= dist;  dy /= dist
+        # Positive projection = moving toward opponent
+        toward = (vx * dx + vy * dy) / (frame_dim + 1e-6)
+        best = max(best, toward)
+    return max(0.0, float(best))
+
+
+def interaction_features(
+    persons_kps:      List[np.ndarray],
+    persons_bbox:     List[Tuple],
+    prev_persons_kps: Optional[List[np.ndarray]] = None,   # NEW
+    frame_dim:        float = 640.0,
+    wrist_thresh:     float = 80.0,
 ) -> np.ndarray:
     """
-    9-element aggregated pairwise interaction vector.
+    15-element aggregated pairwise interaction vector.
     Returns zeros when fewer than 2 persons are present.
 
-    Values: [min, max, mean] × [proximity, bbox_iou, wrist_near_opponent]
+    Values:
+      [min, max, mean] × proximity
+      [min, max, mean] × bbox_iou
+      [min, max, mean] × wrist_near_torso
+      [min, max, mean] × head_proximity      (NEW)
+      [min, max, mean] × wrist_toward_opp    (NEW)
     """
-    out = np.zeros(9, dtype=np.float32)
+    out = np.zeros(15, dtype=np.float32)
     n   = len(persons_kps)
     if n < 2:
         return out
 
-    prox_v, iou_v, wrist_v = [], [], []
+    prox_v, iou_v, wrist_v, head_v, toward_v = [], [], [], [], []
 
     for i in range(n):
         for j in range(i + 1, n):
-            ci = _bbox_center(persons_bbox[i])
-            cj = _bbox_center(persons_bbox[j])
-            dist  = float(np.hypot(ci[0] - cj[0], ci[1] - cj[1]))
-            prox  = max(0.0, 1.0 - dist / (frame_dim + 1e-6))
-            iou   = _bbox_iou(persons_bbox[i], persons_bbox[j])
-            wi    = wrist_near_torso(persons_kps[i], persons_kps[j], wrist_thresh)
-            wj    = wrist_near_torso(persons_kps[j], persons_kps[i], wrist_thresh)
-            wrist = max(wi, wj)
+            ci   = _bbox_center(persons_bbox[i])
+            cj   = _bbox_center(persons_bbox[j])
+            dist = float(np.hypot(ci[0] - cj[0], ci[1] - cj[1]))
 
-            prox_v.append(prox)
-            iou_v.append(iou)
-            wrist_v.append(wrist)
+            prox_v.append(max(0.0, 1.0 - dist / (frame_dim + 1e-6)))
+            iou_v.append(_bbox_iou(persons_bbox[i], persons_bbox[j]))
+            wi = wrist_near_torso(persons_kps[i], persons_kps[j], wrist_thresh)
+            wj = wrist_near_torso(persons_kps[j], persons_kps[i], wrist_thresh)
+            wrist_v.append(max(wi, wj))
+
+            head_v.append(_head_proximity(persons_kps[i], persons_kps[j], frame_dim))
+
+            # Wrist toward opponent (requires prev frame)
+            prev_i = prev_persons_kps[i] if (prev_persons_kps and i < len(prev_persons_kps)) else None
+            prev_j = prev_persons_kps[j] if (prev_persons_kps and j < len(prev_persons_kps)) else None
+            ti = _wrist_velocity_toward_opponent(persons_kps[i], prev_i, persons_bbox[j], frame_dim)
+            tj = _wrist_velocity_toward_opponent(persons_kps[j], prev_j, persons_bbox[i], frame_dim)
+            toward_v.append(max(ti, tj))
 
     if prox_v:
-        out[0], out[1], out[2] = min(prox_v),  max(prox_v),  float(np.mean(prox_v))
-        out[3], out[4], out[5] = min(iou_v),   max(iou_v),   float(np.mean(iou_v))
-        out[6], out[7], out[8] = min(wrist_v), max(wrist_v), float(np.mean(wrist_v))
+        out[0],  out[1],  out[2]  = min(prox_v),  max(prox_v),  float(np.mean(prox_v))
+        out[3],  out[4],  out[5]  = min(iou_v),   max(iou_v),   float(np.mean(iou_v))
+        out[6],  out[7],  out[8]  = min(wrist_v), max(wrist_v), float(np.mean(wrist_v))
+        out[9],  out[10], out[11] = min(head_v),  max(head_v),  float(np.mean(head_v))
+        out[12], out[13], out[14] = min(toward_v),max(toward_v),float(np.mean(toward_v))
 
     return out
 
@@ -274,12 +361,12 @@ def frame_feature_vector(
     Build one row of the feature matrix for a single frame.
 
     Args:
-        persons_kps:         List of (17, 3) arrays — current frame keypoints.
-        persons_bbox:        Matching list of (x1, y1, x2, y2) bboxes.
-        prev_kps:            Same-ordered list from the previous frame (for speed).
-        frame_h / frame_w:   Frame dimensions (for normalisation).
-        include_interaction: False → Ablation B (isolated only, 10-dim).
-                             True  → Ablation C (full, 19-dim).
+        persons_kps:         List of (17, 3) arrays — current frame.
+        persons_bbox:        Matching (x1, y1, x2, y2) bboxes.
+        prev_kps:            Same-ordered list from previous frame (for speed + toward).
+        frame_h / frame_w:   Frame dimensions for normalisation.
+        include_interaction: False → Ablation B (12-dim).
+                             True  → Ablation C (27-dim).
         wrist_thresh:        Pixel radius for wrist-near-torso scoring.
 
     Returns:
@@ -287,7 +374,7 @@ def frame_feature_vector(
     """
     frame_dim = float(max(frame_h, frame_w))
 
-    # ── Isolated block ─────────────────────────────────────────────────────
+    # ── Isolated block (5 features × mean/max = 10) ───────────────────────
     if persons_kps:
         ppf_list = [
             per_person_features(
@@ -297,11 +384,11 @@ def frame_feature_vector(
             )
             for idx, (kps, bbox) in enumerate(zip(persons_kps, persons_bbox))
         ]
-        ppf       = np.stack(ppf_list)                          # (N, 4)
-        iso_block = np.concatenate([ppf.mean(0), ppf.max(0)])   # (8,)
+        ppf        = np.stack(ppf_list)                          # (N, 5)
+        iso_block  = np.concatenate([ppf.mean(0), ppf.max(0)])   # (10,)
         mean_speed = float(ppf[:, 1].mean())
     else:
-        iso_block  = np.zeros(8,  dtype=np.float32)
+        iso_block  = np.zeros(10, dtype=np.float32)
         mean_speed = 0.0
 
     scene = np.array([
@@ -310,11 +397,13 @@ def frame_feature_vector(
     ], dtype=np.float32)
 
     if not include_interaction:
-        return np.concatenate([iso_block, scene]).astype(np.float32)
+        return np.concatenate([iso_block, scene]).astype(np.float32)   # (12,)
 
-    # ── Interaction block ──────────────────────────────────────────────────
+    # ── Interaction block (15 values) ─────────────────────────────────────
     inter = interaction_features(
         persons_kps, persons_bbox,
-        frame_dim=frame_dim, wrist_thresh=wrist_thresh,
+        prev_persons_kps=prev_kps,
+        frame_dim=frame_dim,
+        wrist_thresh=wrist_thresh,
     )
-    return np.concatenate([iso_block, scene, inter]).astype(np.float32)
+    return np.concatenate([iso_block, scene, inter]).astype(np.float32)  # (27,)
