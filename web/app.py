@@ -89,7 +89,8 @@ seed_demo_users()
 detector: ThreadSafeDetector = None
 video_source = None
 is_running = False
-current_frame = None
+current_frame = None      # annotated (skeleton + boxes)
+current_raw_frame = None  # clean camera frame, no overlay
 frame_lock = threading.Lock()
 
 stats = {
@@ -269,7 +270,7 @@ def _save_screenshot(annotated_frame) -> str | None:
 
 def generate_frames():
     """Generator for MJPEG video streaming. Saves incidents and emits SocketIO events."""
-    global current_frame, is_running, stats
+    global current_frame, current_raw_frame, is_running, stats
 
     cap = cv2.VideoCapture(video_source)
     if not cap.isOpened():
@@ -300,6 +301,10 @@ def generate_frames():
 
             # Draw boxes FIRST so the saved screenshot includes them
             annotated = detector.draw_results(frame, result)
+
+            # Keep a clean copy so security can toggle the overlay off
+            with frame_lock:
+                current_raw_frame = frame.copy()
 
             if result.has_violence:
                 stats['violence_detections'] += 1
@@ -373,10 +378,65 @@ def index():
     return render_template('index.html')
 
 
+def _stream_current_frame():
+    """
+    MJPEG generator that reads from the shared current_frame buffer.
+    Multiple simultaneous clients can connect without opening extra VideoCapture
+    instances — the detector writes frames once; all clients read from that copy.
+    When no frame is available yet, the generator sleeps and retries.
+    """
+    while True:
+        with frame_lock:
+            frame = current_frame.copy() if current_frame is not None else None
+
+        if frame is None:
+            # Detector not started yet — wait and retry
+            time.sleep(0.1)
+            continue
+
+        _, buffer = cv2.imencode(
+            '.jpg', frame,
+            [cv2.IMWRITE_JPEG_QUALITY, WebConfig.STREAM_QUALITY]
+        )
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+        time.sleep(1.0 / WebConfig.STREAM_FPS)
+
+
+def _stream_raw_frame():
+    """MJPEG generator that serves the clean camera frame with no skeleton overlay."""
+    while True:
+        with frame_lock:
+            frame = current_raw_frame.copy() if current_raw_frame is not None else None
+
+        if frame is None:
+            time.sleep(0.1)
+            continue
+
+        _, buffer = cv2.imencode(
+            '.jpg', frame,
+            [cv2.IMWRITE_JPEG_QUALITY, WebConfig.STREAM_QUALITY]
+        )
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+        time.sleep(1.0 / WebConfig.STREAM_FPS)
+
+
 @app.route('/video_feed')
-def video_feed():
+@app.route('/video_feed/<stream_id>')
+def video_feed(stream_id=None):
     return Response(
-        generate_frames(),
+        _stream_current_frame(),
+        mimetype='multipart/x-mixed-replace; boundary=frame'
+    )
+
+
+@app.route('/video_feed/raw')
+@app.route('/video_feed/<stream_id>/raw')
+def video_feed_raw(stream_id=None):
+    """Clean camera feed — no skeleton or bounding-box overlay."""
+    return Response(
+        _stream_raw_frame(),
         mimetype='multipart/x-mixed-replace; boundary=frame'
     )
 
