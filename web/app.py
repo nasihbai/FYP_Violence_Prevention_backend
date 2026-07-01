@@ -130,6 +130,15 @@ def initialize_detector(model_path: str = None, source=0, use_yolo: bool = True)
     detector.start()
     logger.info(f"Detector initialised — source: {source}")
 
+    # Auto-start the capture loop so the camera feed is live immediately on boot.
+    # The /api/start route guards against double-start via `is_running`.
+    threading.Thread(
+        target=lambda: list(generate_frames()),
+        daemon=True,
+        name="generate_frames",
+    ).start()
+    logger.info("Frame capture thread started automatically")
+
 
 def _get_or_create_stream(session, source) -> Stream:
     """Return the Stream record for the current video source, creating it if absent."""
@@ -283,6 +292,17 @@ def generate_frames():
     # Resolve stream_id once so we don't recalculate every frame
     stream_id = f"CAM_{video_source}" if isinstance(video_source, int) \
         else Path(str(video_source)).stem.upper()
+
+    # Register the stream in the DB immediately so the dashboard's camera
+    # grid switches from demo data to the real feed URL without waiting for
+    # a violence event to fire first.
+    try:
+        _sess = get_session()
+        _get_or_create_stream(_sess, video_source)
+        _sess.commit()
+        _sess.close()
+    except Exception as _e:
+        logger.warning(f"Could not register stream on start: {_e}")
 
     last_screenshot_time = 0.0
 
