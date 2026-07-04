@@ -18,6 +18,7 @@ Response shapes:
 import io
 import json
 import logging
+import sys
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -30,6 +31,40 @@ from database.db import get_session
 from database.models import Alert, Incident, Stream, User, Setting, DetectionLog
 
 logger = logging.getLogger(__name__)
+
+
+def _get_stream_manager():
+    """
+    Lazily reach into web.app's StreamManager singleton.
+    Looked up via sys.modules rather than `from . import app`, because
+    web/__init__.py does `from .app import app` — that binds the *Flask
+    instance* to the name `app` in the `web` package namespace, shadowing
+    the `web.app` submodule. sys.modules["web.app"] always resolves to the
+    actual module. Deferred (not imported at module top) so this blueprint
+    keeps working when registered against a slim, detector-free server — in
+    that case the lookup fails and callers just skip starting/stopping a worker.
+    """
+    try:
+        return sys.modules["web.app"].stream_manager
+    except Exception:
+        return None
+
+
+def _coerce_source(source_url):
+    source_url = str(source_url).strip()
+    return int(source_url) if source_url.isdigit() else source_url
+
+
+def _can_open_source(source_url) -> bool:
+    """Quick open+release check so a bad camera source_url is rejected immediately."""
+    try:
+        import cv2
+    except Exception:
+        return True  # cv2 unavailable (slim server) — skip the check rather than block
+    cap = cv2.VideoCapture(_coerce_source(source_url))
+    ok = cap.isOpened()
+    cap.release()
+    return ok
 
 # Lazy YOLO loader for the review screenshot endpoint — we only need it
 # on demand, not at import time, so the slim auth server stays fast.
@@ -264,6 +299,14 @@ def get_incident(incident_id):
 # Streams (cameras)
 # ---------------------------------------------------------------------------
 
+def _serialize_stream(stream: Stream) -> dict:
+    """Stream.to_dict() plus a live `is_live` flag from the running StreamManager."""
+    data = stream.to_dict()
+    manager = _get_stream_manager()
+    data["is_live"] = bool(manager and manager.is_live(stream.stream_id))
+    return data
+
+
 @api_bp.route("/streams", methods=["GET"])
 @jwt_required()
 def list_streams():
@@ -280,7 +323,7 @@ def list_streams():
             q = q.filter(Stream.is_active == is_active)
         items = q.order_by(Stream.stream_id.asc()).all()
         return jsonify({
-            "items": [s.to_dict() for s in items],
+            "items": [_serialize_stream(s) for s in items],
             "total": len(items),
             "limit": len(items),
             "offset": 0,
@@ -297,7 +340,7 @@ def get_stream(stream_pk):
         stream = session.query(Stream).get(stream_pk)
         if not stream:
             return jsonify({"errors": {"_": ["Stream not found"]}}), 404
-        return jsonify(stream.to_dict())
+        return jsonify(_serialize_stream(stream))
     finally:
         session.close()
 
@@ -320,6 +363,10 @@ def create_stream():
     if errors:
         return jsonify({"errors": errors}), 422
 
+    source_url = str(data["source_url"]).strip()
+    if not _can_open_source(source_url):
+        return jsonify({"errors": {"source_url": ["Could not open this video source"]}}), 422
+
     session = get_session()
     try:
         existing = session.query(Stream).filter_by(stream_id=data["stream_id"].strip()).first()
@@ -329,13 +376,18 @@ def create_stream():
         stream = Stream(
             stream_id=data["stream_id"].strip(),
             name=data["name"].strip(),
-            source_url=str(data["source_url"]).strip(),
+            source_url=source_url,
             location=(data.get("location") or "").strip() or None,
             is_active=bool(data.get("is_active", True)),
         )
         session.add(stream)
         session.commit()
-        return jsonify(stream.to_dict()), 201
+
+        manager = _get_stream_manager()
+        if manager and stream.is_active:
+            manager.start_stream(stream.stream_id, stream.source_url)
+
+        return jsonify(_serialize_stream(stream)), 201
     finally:
         session.close()
 
@@ -358,21 +410,37 @@ def update_stream(stream_pk):
         if not stream:
             return jsonify({"errors": {"_": ["Stream not found"]}}), 404
 
+        source_changed = False
         if "name" in data:
             if not str(data["name"]).strip():
                 return jsonify({"errors": {"name": ["name cannot be empty"]}}), 422
             stream.name = data["name"].strip()
         if "source_url" in data:
-            if not str(data["source_url"]).strip():
+            new_source = str(data["source_url"]).strip()
+            if not new_source:
                 return jsonify({"errors": {"source_url": ["source_url cannot be empty"]}}), 422
-            stream.source_url = str(data["source_url"]).strip()
+            if not _can_open_source(new_source):
+                return jsonify({"errors": {"source_url": ["Could not open this video source"]}}), 422
+            source_changed = new_source != stream.source_url
+            stream.source_url = new_source
         if "location" in data:
             stream.location = (data.get("location") or "").strip() or None
+        was_active = stream.is_active
         if "is_active" in data:
             stream.is_active = bool(data["is_active"])
 
         session.commit()
-        return jsonify(stream.to_dict())
+
+        manager = _get_stream_manager()
+        if manager:
+            if not stream.is_active:
+                manager.stop_stream(stream.stream_id)
+            elif source_changed:
+                manager.restart_stream(stream.stream_id, stream.source_url)
+            elif stream.is_active and not was_active:
+                manager.start_stream(stream.stream_id, stream.source_url)
+
+        return jsonify(_serialize_stream(stream))
     finally:
         session.close()
 
@@ -395,7 +463,12 @@ def delete_stream(stream_pk):
             return jsonify({"errors": {"_": ["Stream not found"]}}), 404
         stream.is_active = False
         session.commit()
-        return jsonify(stream.to_dict())
+
+        manager = _get_stream_manager()
+        if manager:
+            manager.stop_stream(stream.stream_id)
+
+        return jsonify(_serialize_stream(stream))
     finally:
         session.close()
 

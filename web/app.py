@@ -27,11 +27,12 @@ from flask import Flask, render_template, Response, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO
 from flask_jwt_extended import JWTManager
+from sqlalchemy.exc import IntegrityError
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import WebConfig, VideoConfig, AlertConfig
-from core.detection_engine import ThreadSafeDetector, FrameResult
+from core.stream_manager import StreamManager
 from database import init_db, User, Stream, Incident, Alert, DetectionLog
 from database.db import get_session
 from .auth import auth_bp, require_manage_role, seed_demo_users
@@ -86,58 +87,61 @@ seed_demo_users()
 
 # ==================== GLOBAL STATE ====================
 
-detector: ThreadSafeDetector = None
-video_source = None
-is_running = False
-current_frame = None      # annotated (skeleton + boxes)
-current_raw_frame = None  # clean camera frame, no overlay
-frame_lock = threading.Lock()
-
-stats = {
-    'total_frames': 0,
-    'violence_detections': 0,
-    'alerts_triggered': 0,
-    'start_time': None,
-    'current_fps': 0,
-}
+# One StreamWorker per registered camera, orchestrated by this manager.
+# `primary_stream_id` is the source the process was launched with (CLI arg /
+# settings) — the legacy single-stream routes (/api/start, /api/stats, ...)
+# stay scoped to it rather than being made per-stream.
+stream_manager: StreamManager = None
+primary_stream_id: str = None
 
 
 # ==================== HELPERS ====================
 
+def _resolve_model_path(model_path: str = None) -> str | None:
+    if model_path:
+        return model_path
+    root = Path(__file__).parent.parent
+    # Prefer the 132-feature model that matches the current pipeline
+    candidates = [
+        root / 'models' / 'violence_lstm_dataset.h5',   # 309-feature, proven pipeline
+        root / 'lstm-model.h5',
+        root / 'models' / 'violence_lstm_rwf2000.h5',
+        root / 'models' / 'violence_lstm_enhanced.h5',
+    ]
+    return next((str(p) for p in candidates if p.exists()), None)
+
+
 def initialize_detector(model_path: str = None, source=0, use_yolo: bool = True):
-    """Initialise the detection system."""
-    global detector, video_source
+    """Initialise multi-stream orchestration and start the primary (CLI) source."""
+    global stream_manager, primary_stream_id
 
-    video_source = source
+    resolved_model_path = _resolve_model_path(model_path)
+    model_path = resolved_model_path if resolved_model_path and Path(resolved_model_path).exists() else None
 
-    if model_path is None:
-        root = Path(__file__).parent.parent
-        # Prefer the 132-feature model that matches the current pipeline
-        candidates = [
-            root / 'models' / 'violence_lstm_dataset.h5',   # 309-feature, proven pipeline
-            root / 'lstm-model.h5',
-            root / 'models' / 'violence_lstm_rwf2000.h5',
-            root / 'models' / 'violence_lstm_enhanced.h5',
-        ]
-        model_path = next((str(p) for p in candidates if p.exists()), None)
-
-    detector = ThreadSafeDetector(
-        lstm_model_path=model_path if model_path and Path(model_path).exists() else None,
+    stream_manager = StreamManager(
+        model_path=model_path,
         use_yolo=use_yolo,
-        use_scene_classifier=True,
-        use_person_classifier=False,
+        on_violence=_save_incident,
+        on_alert=lambda incident_data: socketio.emit('violence_alert', incident_data),
+        on_log=_write_detection_log,
     )
-    detector.start()
-    logger.info(f"Detector initialised — source: {source}")
 
-    # Auto-start the capture loop so the camera feed is live immediately on boot.
-    # The /api/start route guards against double-start via `is_running`.
-    threading.Thread(
-        target=lambda: list(generate_frames()),
-        daemon=True,
-        name="generate_frames",
-    ).start()
-    logger.info("Frame capture thread started automatically")
+    # Ensure the primary Stream row exists, then start it explicitly so the
+    # CLI-supplied source always wins even if an older row with the same
+    # stream_id has a stale source_url.
+    session = get_session()
+    try:
+        stream = _get_or_create_stream(session, source)
+        session.commit()
+        primary_stream_id = stream.stream_id
+    finally:
+        session.close()
+
+    stream_manager.start_stream(primary_stream_id, source)
+    logger.info(f"Primary stream '{primary_stream_id}' started — source: {source}")
+
+    # Resume any other cameras that were left active from a previous run.
+    stream_manager.sync_from_db()
 
 
 def _get_or_create_stream(session, source) -> Stream:
@@ -158,14 +162,16 @@ def _get_or_create_stream(session, source) -> Stream:
 
 
 def _save_incident(
+    stream_id: str,
     det,
     screenshot_path: str = None,
     scene_violence_score: float = None,
     person_count: int = None,
 ) -> dict | None:
     """
-    Persist a violence detection event.
-    Creates: Stream (if needed) → Incident → Alert.
+    Persist a violence detection event for the given stream.
+    Creates: Incident → Alert. The Stream row is expected to already exist
+    (every running StreamWorker's stream_id is backed by a Stream row).
     Returns the Alert dict (matches the shape the Vue store expects).
     """
     session = get_session()
@@ -182,28 +188,42 @@ def _save_incident(
 
         alert_type = 'violent' if severity in ('high', 'medium') else 'threatening'
 
-        stream = _get_or_create_stream(session, video_source)
+        stream = session.query(Stream).filter_by(stream_id=stream_id).first()
+        if not stream:
+            logger.warning(f"No Stream row for '{stream_id}'; incident logged without location")
 
-        # Generate human-readable incident code
+        # Generate a human-readable incident code. With multiple StreamWorkers
+        # detecting violence concurrently, two threads can read the same
+        # count() before either commits — retry on the resulting unique
+        # constraint violation instead of losing the incident.
         year = datetime.utcnow().year
-        count = session.query(Incident).count() + 1
-        incident_code = f"INC-{year}-{count:04d}"
-
-        incident = Incident(
-            incident_code=incident_code,
-            stream_id=stream.stream_id,
-            type=alert_type,
-            confidence=confidence,
-            scene_violence_score=scene_violence_score,
-            person_count=person_count,
-            timestamp=datetime.utcnow(),
-            location=stream.location,
-            screenshot_path=screenshot_path,
-            severity=severity,
-            status='open',
-        )
-        session.add(incident)
-        session.flush()
+        incident = None
+        for attempt in range(5):
+            count = session.query(Incident).count() + 1
+            incident_code = f"INC-{year}-{count:04d}"
+            incident = Incident(
+                incident_code=incident_code,
+                stream_id=stream_id,
+                type=alert_type,
+                confidence=confidence,
+                scene_violence_score=scene_violence_score,
+                person_count=person_count,
+                timestamp=datetime.utcnow(),
+                location=stream.location if stream else None,
+                screenshot_path=screenshot_path,
+                severity=severity,
+                status='open',
+            )
+            session.add(incident)
+            try:
+                session.flush()
+                break
+            except IntegrityError:
+                session.rollback()
+                incident = None
+        if incident is None:
+            logger.error(f"Failed to generate a unique incident_code after retries (stream={stream_id})")
+            return None
 
         alert = Alert(
             incident_id=incident.id,
@@ -259,130 +279,31 @@ def _write_detection_log(stream_id: str, result, processing_ms: float):
 
 
 # ==================== VIDEO / DETECTION ====================
-
-LOG_INTERVAL = 30       # write a DetectionLog row every N frames
-SCREENSHOT_COOLDOWN = 10  # seconds between saved screenshots per incident burst
-
-
-def _save_screenshot(annotated_frame) -> str | None:
-    """Save the annotated frame to disk. Returns the file path or None on error."""
-    try:
-        screenshot_dir = Path(__file__).parent.parent / 'alerts' / 'screenshots'
-        screenshot_dir.mkdir(parents=True, exist_ok=True)
-        fname = screenshot_dir / f"incident_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
-        cv2.imwrite(str(fname), annotated_frame)
-        return str(fname)
-    except Exception as exc:
-        logger.warning(f"Screenshot save failed: {exc}")
-        return None
-
-
-def generate_frames():
-    """Generator for MJPEG video streaming. Saves incidents and emits SocketIO events."""
-    global current_frame, current_raw_frame, is_running, stats
-
-    cap = cv2.VideoCapture(video_source)
-    if not cap.isOpened():
-        logger.error(f"Failed to open video source: {video_source}")
-        return
-
-    is_running = True
-    stats['start_time'] = datetime.now()
-
-    # Resolve stream_id once so we don't recalculate every frame
-    stream_id = f"CAM_{video_source}" if isinstance(video_source, int) \
-        else Path(str(video_source)).stem.upper()
-
-    # Register the stream in the DB immediately so the dashboard's camera
-    # grid switches from demo data to the real feed URL without waiting for
-    # a violence event to fire first.
-    try:
-        _sess = get_session()
-        _get_or_create_stream(_sess, video_source)
-        _sess.commit()
-        _sess.close()
-    except Exception as _e:
-        logger.warning(f"Could not register stream on start: {_e}")
-
-    last_screenshot_time = 0.0
-
-    try:
-        while is_running:
-            t0 = time.time()
-            ret, frame = cap.read()
-            if not ret:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                continue
-
-            result = detector.process_frame(frame)
-            stats['total_frames'] += 1
-            stats['current_fps'] = result.fps
-            processing_ms = (time.time() - t0) * 1000
-
-            # Draw boxes FIRST so the saved screenshot includes them
-            annotated = detector.draw_results(frame, result)
-
-            # Keep a clean copy so security can toggle the overlay off
-            with frame_lock:
-                current_raw_frame = frame.copy()
-
-            if result.has_violence:
-                stats['violence_detections'] += 1
-
-                # Save one screenshot per cooldown window so the review queue
-                # gets a representative frame without flooding disk
-                screenshot_path = None
-                if t0 - last_screenshot_time >= SCREENSHOT_COOLDOWN:
-                    screenshot_path = _save_screenshot(annotated)
-                    if screenshot_path:
-                        last_screenshot_time = t0
-
-                for det in result.detections:
-                    if det.is_violent:
-                        stats['alerts_triggered'] += 1
-                        incident_data = _save_incident(
-                            det,
-                            screenshot_path=screenshot_path,
-                            scene_violence_score=round(result.scene_violence_prob, 4),
-                            person_count=len(result.detections),
-                        )
-                        if incident_data:
-                            socketio.emit('violence_alert', incident_data)
-
-            # Write detection log every LOG_INTERVAL frames
-            if stats['total_frames'] % LOG_INTERVAL == 0:
-                _write_detection_log(stream_id, result, processing_ms)
-
-            with frame_lock:
-                current_frame = annotated.copy()
-
-            _, buffer = cv2.imencode(
-                '.jpg', annotated,
-                [cv2.IMWRITE_JPEG_QUALITY, WebConfig.STREAM_QUALITY]
-            )
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-
-            time.sleep(1.0 / WebConfig.STREAM_FPS)
-    finally:
-        cap.release()
-        is_running = False
+# Per-stream capture, detection, incident/log persistence, and screenshot
+# saving now live in core/stream_manager.py (StreamWorker). This module just
+# wires StreamManager's callbacks to the DB/SocketIO and exposes per-stream
+# MJPEG routes.
 
 
 def _stats_broadcaster():
-    """Background thread: push live stats to all connected clients every second."""
+    """Background thread: push aggregate live stats to all connected clients every second."""
     while True:
+        agg = stream_manager.aggregate_stats() if stream_manager else {
+            'total_frames': 0, 'violence_detections': 0, 'alerts_triggered': 0,
+            'current_fps': 0, 'is_running': False,
+        }
+        primary = stream_manager.get_worker(primary_stream_id) if stream_manager and primary_stream_id else None
         uptime = None
-        if stats['start_time']:
-            uptime = str(datetime.now() - stats['start_time']).split('.')[0]
+        if primary and primary.stats['start_time']:
+            uptime = str(datetime.now() - datetime.fromtimestamp(primary.stats['start_time'])).split('.')[0]
 
         socketio.emit('stats_update', {
-            'total_frames': stats['total_frames'],
-            'violence_detections': stats['violence_detections'],
-            'alerts_triggered': stats['alerts_triggered'],
-            'current_fps': round(stats['current_fps'], 1),
+            'total_frames': agg['total_frames'],
+            'violence_detections': agg['violence_detections'],
+            'alerts_triggered': agg['alerts_triggered'],
+            'current_fps': agg['current_fps'],
             'uptime': uptime or '00:00:00',
-            'is_running': is_running,
+            'is_running': agg['is_running'],
         })
         time.sleep(1)
 
@@ -398,37 +319,21 @@ def index():
     return render_template('index.html')
 
 
-def _stream_current_frame():
+def _stream_worker_frames(stream_id: str, raw: bool = False):
     """
-    MJPEG generator that reads from the shared current_frame buffer.
-    Multiple simultaneous clients can connect without opening extra VideoCapture
-    instances — the detector writes frames once; all clients read from that copy.
-    When no frame is available yet, the generator sleeps and retries.
+    MJPEG generator that reads from one StreamWorker's frame buffer.
+    Multiple simultaneous clients for the same stream_id share the same
+    worker — the worker writes frames once; all clients read that copy.
     """
     while True:
-        with frame_lock:
-            frame = current_frame.copy() if current_frame is not None else None
-
-        if frame is None:
-            # Detector not started yet — wait and retry
-            time.sleep(0.1)
+        worker = stream_manager.get_worker(stream_id) if stream_manager else None
+        if worker is None:
+            # Unknown or not-yet-started stream — wait and retry rather than
+            # erroring, in case the worker is still starting up.
+            time.sleep(0.5)
             continue
 
-        _, buffer = cv2.imencode(
-            '.jpg', frame,
-            [cv2.IMWRITE_JPEG_QUALITY, WebConfig.STREAM_QUALITY]
-        )
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-        time.sleep(1.0 / WebConfig.STREAM_FPS)
-
-
-def _stream_raw_frame():
-    """MJPEG generator that serves the clean camera frame with no skeleton overlay."""
-    while True:
-        with frame_lock:
-            frame = current_raw_frame.copy() if current_raw_frame is not None else None
-
+        frame = worker.get_frame(raw=raw)
         if frame is None:
             time.sleep(0.1)
             continue
@@ -446,7 +351,7 @@ def _stream_raw_frame():
 @app.route('/video_feed/<stream_id>')
 def video_feed(stream_id=None):
     return Response(
-        _stream_current_frame(),
+        _stream_worker_frames(stream_id or primary_stream_id, raw=False),
         mimetype='multipart/x-mixed-replace; boundary=frame'
     )
 
@@ -456,31 +361,38 @@ def video_feed(stream_id=None):
 def video_feed_raw(stream_id=None):
     """Clean camera feed — no skeleton or bounding-box overlay."""
     return Response(
-        _stream_raw_frame(),
+        _stream_worker_frames(stream_id or primary_stream_id, raw=True),
         mimetype='multipart/x-mixed-replace; boundary=frame'
     )
 
 
 @app.route('/api/stats')
 def get_stats():
+    agg = stream_manager.aggregate_stats() if stream_manager else {
+        'total_frames': 0, 'violence_detections': 0, 'alerts_triggered': 0,
+        'current_fps': 0, 'is_running': False,
+    }
+    primary = stream_manager.get_worker(primary_stream_id) if stream_manager and primary_stream_id else None
     uptime = None
-    if stats['start_time']:
-        uptime = str(datetime.now() - stats['start_time']).split('.')[0]
+    if primary and primary.stats['start_time']:
+        uptime = str(datetime.now() - datetime.fromtimestamp(primary.stats['start_time'])).split('.')[0]
     return jsonify({
-        'total_frames': stats['total_frames'],
-        'violence_detections': stats['violence_detections'],
-        'alerts_triggered': stats['alerts_triggered'],
-        'current_fps': round(stats['current_fps'], 1),
+        'total_frames': agg['total_frames'],
+        'violence_detections': agg['violence_detections'],
+        'alerts_triggered': agg['alerts_triggered'],
+        'current_fps': agg['current_fps'],
         'uptime': uptime,
-        'is_running': is_running,
+        'is_running': agg['is_running'],
     })
 
 
 @app.route('/api/config', methods=['GET', 'POST'])
 def config():
+    primary = stream_manager.get_worker(primary_stream_id) if stream_manager and primary_stream_id else None
+    detector = primary.detector if primary else None
     if request.method == 'GET':
         return jsonify({
-            'video_source': video_source,
+            'video_source': primary.source_url if primary else None,
             'violence_threshold': detector.violence_threshold if detector else 0.6,
             'use_yolo': detector.use_yolo if detector else True,
             'warmup_frames': detector.warmup_frames if detector else 30,
@@ -496,12 +408,17 @@ def start_detection():
     _, err = require_manage_role()
     if err:
         return err
-    global is_running
-    if not is_running:
-        threading.Thread(
-            target=lambda: list(generate_frames()),
-            daemon=True
-        ).start()
+    if not primary_stream_id:
+        return jsonify({'error': 'No primary stream configured'}), 400
+    worker = stream_manager.get_worker(primary_stream_id)
+    if worker is None or not worker._running:
+        session = get_session()
+        try:
+            stream = session.query(Stream).filter_by(stream_id=primary_stream_id).first()
+            source_url = stream.source_url if stream else primary_stream_id
+        finally:
+            session.close()
+        stream_manager.start_stream(primary_stream_id, source_url)
         return jsonify({'status': 'started'})
     return jsonify({'status': 'already_running'})
 
@@ -511,8 +428,8 @@ def stop_detection():
     _, err = require_manage_role()
     if err:
         return err
-    global is_running
-    is_running = False
+    if primary_stream_id:
+        stream_manager.stop_stream(primary_stream_id)
     return jsonify({'status': 'stopped'})
 
 
@@ -521,34 +438,37 @@ def reset_stats():
     _, err = require_manage_role()
     if err:
         return err
-    global stats
-    stats = {
-        'total_frames': 0,
-        'violence_detections': 0,
-        'alerts_triggered': 0,
-        'start_time': datetime.now() if is_running else None,
-        'current_fps': 0,
-    }
-    if detector:
-        detector.reset()
+    primary = stream_manager.get_worker(primary_stream_id) if stream_manager and primary_stream_id else None
+    if primary:
+        primary.stats = {
+            'total_frames': 0,
+            'violence_detections': 0,
+            'alerts_triggered': 0,
+            'start_time': time.time() if primary._running else None,
+            'current_fps': 0,
+        }
+        if primary.detector:
+            primary.detector.reset()
     return jsonify({'status': 'reset'})
 
 
 @app.route('/api/snapshot')
 def snapshot():
-    with frame_lock:
-        if current_frame is not None:
-            _, buffer = cv2.imencode('.jpg', current_frame)
-            return Response(buffer.tobytes(), mimetype='image/jpeg')
+    primary = stream_manager.get_worker(primary_stream_id) if stream_manager and primary_stream_id else None
+    frame = primary.get_frame() if primary else None
+    if frame is not None:
+        _, buffer = cv2.imencode('.jpg', frame)
+        return Response(buffer.tobytes(), mimetype='image/jpeg')
     return jsonify({'error': 'No frame available'}), 404
 
 
 @app.route('/health')
 def health():
+    primary = stream_manager.get_worker(primary_stream_id) if stream_manager and primary_stream_id else None
     return jsonify({
         'status': 'healthy',
-        'detector_loaded': detector is not None,
-        'is_running': is_running,
+        'detector_loaded': primary is not None and primary.detector is not None,
+        'is_running': primary is not None and primary._running,
     })
 
 

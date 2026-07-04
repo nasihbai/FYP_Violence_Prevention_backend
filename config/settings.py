@@ -96,6 +96,15 @@ class DetectionConfig:
         "weapon_threat"
     ]
 
+    # Multi-stream frame-skip: run the full YOLO+pose+LSTM pipeline on every
+    # Nth captured frame per stream; skipped frames reuse the last detection
+    # result and just get redrawn onto the newest raw frame to keep video
+    # smooth. 1 = detect every frame (default — matches original
+    # single-stream behavior exactly, no change to prediction cadence).
+    # Only raise this for multi-stream demos: it changes the effective
+    # temporal sampling rate the sequence models see. Signed off 2026-07-02.
+    DETECT_FRAME_SKIP = int(os.environ.get('DETECT_FRAME_SKIP', '1'))
+
 # =============================================================================
 # ALERT CONFIGURATION
 # =============================================================================
