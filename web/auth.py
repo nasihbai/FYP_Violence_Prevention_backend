@@ -7,7 +7,7 @@ seed_demo_users() is called at app startup to ensure the default
 accounts (matching jBoilerplate example-users.ts) always exist.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import (
     create_access_token,
@@ -17,6 +17,9 @@ from flask_jwt_extended import (
     verify_jwt_in_request,
 )
 from werkzeug.security import generate_password_hash, check_password_hash
+
+from config import EmailConfig
+from .email_utils import generate_verification_token, send_verification_email
 
 auth_bp = Blueprint('auth', __name__, url_prefix='/auth')
 
@@ -57,6 +60,7 @@ def seed_demo_users():
                     password=generate_password_hash(u['password']),
                     role=u['role'],
                     is_active=True,
+                    is_verified=True,  # demo accounts must not be blocked by the verification gate
                 ))
         session.commit()
     except Exception as exc:
@@ -87,6 +91,9 @@ def login():
         if not user or not check_password_hash(user.password, password):
             return jsonify({'message': 'Invalid email or password'}), 401
 
+        if not user.is_verified:
+            return jsonify({'message': 'Please verify your email before logging in.'}), 403
+
         # Stamp last_login
         user.last_login = datetime.utcnow()
         session.commit()
@@ -113,6 +120,133 @@ def login():
                 'avatar':    '',
             },
         })
+    finally:
+        session.close()
+
+
+@auth_bp.route('/register', methods=['POST'])
+def register():
+    """
+    Create an unverified account and email a verification link.
+    Body:     { username, email, password }
+    Response: 201 { id, username, email, message }
+              422 { errors: { <field>: [msg] } }  (missing fields / duplicate username or email)
+    Does NOT log the user in — no access_token is returned (login is gated on is_verified).
+    """
+    from database.db import get_session
+    from database.models import User
+
+    data = request.get_json(silent=True) or {}
+    errors = {}
+    for field in ("username", "email", "password"):
+        if not str(data.get(field, "")).strip():
+            errors[field] = [f"{field} is required"]
+    if errors:
+        return jsonify({"errors": errors}), 422
+
+    username = data["username"].strip()
+    email = data["email"].strip().lower()
+
+    session = get_session()
+    try:
+        if session.query(User).filter_by(username=username).first():
+            return jsonify({"errors": {"username": ["Username already taken"]}}), 422
+        if session.query(User).filter_by(email=email).first():
+            return jsonify({"errors": {"email": ["Email already registered"]}}), 422
+
+        token = generate_verification_token()
+        user = User(
+            username=username,
+            email=email,
+            password=generate_password_hash(data["password"]),
+            role="user",
+            is_active=True,
+            is_verified=False,
+            verification_token=token,
+            verification_token_expires_at=(
+                datetime.utcnow() + timedelta(hours=EmailConfig.VERIFICATION_TOKEN_TTL_HOURS)
+            ),
+        )
+        session.add(user)
+        session.commit()
+
+        send_verification_email(user.email, user.username, token)
+
+        return jsonify({
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "message": "Registration successful. Please check your email to verify your account.",
+        }), 201
+    finally:
+        session.close()
+
+
+@auth_bp.route('/verify-email', methods=['POST'])
+def verify_email():
+    """
+    Body:     { token }
+    Response: 200 { message, email }
+              400 { errors: { token: ["Invalid verification token"] } }
+              400 { errors: { token: ["Verification link has expired"] } }
+    """
+    from database.db import get_session
+    from database.models import User
+
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip()
+    if not token:
+        return jsonify({"errors": {"token": ["Token is required"]}}), 400
+
+    session = get_session()
+    try:
+        user = session.query(User).filter_by(verification_token=token).first()
+        if not user:
+            return jsonify({"errors": {"token": ["Invalid verification token"]}}), 400
+        if not user.verification_token_expires_at or user.verification_token_expires_at < datetime.utcnow():
+            return jsonify({"errors": {"token": ["Verification link has expired"]}}), 400
+
+        user.is_verified = True
+        user.verification_token = None
+        user.verification_token_expires_at = None
+        session.commit()
+
+        return jsonify({"message": "Email verified successfully. You can now log in.", "email": user.email})
+    finally:
+        session.close()
+
+
+@auth_bp.route('/resend-verification', methods=['POST'])
+def resend_verification():
+    """
+    Body:     { email }
+    Response: 200 { message }  (also 200 if already verified — informational, not an error)
+              422 { errors: { email: ["No account found with that email"] } }
+    """
+    from database.db import get_session
+    from database.models import User
+
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        return jsonify({"errors": {"email": ["Email is required"]}}), 422
+
+    session = get_session()
+    try:
+        user = session.query(User).filter_by(email=email).first()
+        if not user:
+            return jsonify({"errors": {"email": ["No account found with that email"]}}), 422
+        if user.is_verified:
+            return jsonify({"message": "Your email is already verified — you can log in."})
+
+        token = generate_verification_token()
+        user.verification_token = token
+        user.verification_token_expires_at = (
+            datetime.utcnow() + timedelta(hours=EmailConfig.VERIFICATION_TOKEN_TTL_HOURS)
+        )
+        session.commit()
+        send_verification_email(user.email, user.username, token)
+        return jsonify({"message": "Verification email resent."})
     finally:
         session.close()
 

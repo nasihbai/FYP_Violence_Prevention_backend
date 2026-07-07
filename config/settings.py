@@ -106,6 +106,23 @@ class DetectionConfig:
     DETECT_FRAME_SKIP = int(os.environ.get('DETECT_FRAME_SKIP', '1'))
 
 # =============================================================================
+# EMAIL / SMTP CONFIGURATION — shared by violence-alert emails (alerts/) and
+# auth verification emails (web/email_utils.py). Same mailbox in practice.
+# =============================================================================
+class EmailConfig:
+    ENABLED = os.environ.get("EMAIL_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+    SMTP_SERVER = os.environ.get("EMAIL_SMTP_SERVER", "smtp.gmail.com")
+    SMTP_PORT = int(os.environ.get("EMAIL_SMTP_PORT", "587"))
+    SENDER = os.environ.get("EMAIL_SENDER", "")
+    PASSWORD = os.environ.get("EMAIL_PASSWORD", "")  # Use app-specific password
+
+    # Base URL of the running frontend — used to build the link emailed to users.
+    FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3001")
+
+    # How long a registration verification token stays valid.
+    VERIFICATION_TOKEN_TTL_HOURS = int(os.environ.get("EMAIL_VERIFICATION_TTL_HOURS", "24"))
+
+# =============================================================================
 # ALERT CONFIGURATION
 # =============================================================================
 class AlertConfig:
@@ -118,11 +135,11 @@ class AlertConfig:
     SOUND_FILE = BASE_DIR / "alert.wav"
 
     # Email alerts
-    EMAIL_ENABLED = False
-    EMAIL_SMTP_SERVER = "smtp.gmail.com"
-    EMAIL_SMTP_PORT = 587
-    EMAIL_SENDER = ""
-    EMAIL_PASSWORD = ""  # Use app-specific password
+    EMAIL_ENABLED = EmailConfig.ENABLED
+    EMAIL_SMTP_SERVER = EmailConfig.SMTP_SERVER
+    EMAIL_SMTP_PORT = EmailConfig.SMTP_PORT
+    EMAIL_SENDER = EmailConfig.SENDER
+    EMAIL_PASSWORD = EmailConfig.PASSWORD
     EMAIL_RECIPIENTS = []
 
     # Webhook alerts (Slack, Discord, etc.)
