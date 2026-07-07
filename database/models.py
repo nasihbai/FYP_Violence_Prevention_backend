@@ -32,6 +32,10 @@ class User(Base):
     created_at  = Column(DateTime,    nullable=False, default=datetime.utcnow)
     last_login  = Column(DateTime,    nullable=True)
 
+    is_verified                   = Column(Boolean,  nullable=False, default=False)
+    verification_token            = Column(String(64), nullable=True)
+    verification_token_expires_at = Column(DateTime, nullable=True)
+
     # Relationships
     incidents_created    = relationship('Incident', back_populates='creator',
                                         foreign_keys='Incident.created_by')
